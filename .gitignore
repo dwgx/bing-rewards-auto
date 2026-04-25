@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+
+# Auth state — contains login cookies, NEVER commit
+auth.json
+auth_msedge.json
+auth_chrome.json
+auth_*.json
+
+# Logs
+last_run.log
+last_run_chrome.log
+logs/
+
+# Debug screenshots from interactive testing
+diag*.png
+*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Playwright internal
+.playwright-mcp/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
