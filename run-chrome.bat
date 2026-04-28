@@ -39,7 +39,7 @@ echo Log: %LOGFILE%
 echo.
 
 call .venv\Scripts\activate.bat
-.venv\Scripts\python -u bing_rewards.py --browser chrome %PYARGS% 2>&1 | powershell -NoProfile -Command "$input | Tee-Object -FilePath '%LOGFILE%'"
+.venv\Scripts\python -u bing_rewards.py --browser chrome %PYARGS% 2>&1 | powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $input | ForEach-Object { Write-Host $_; Add-Content -LiteralPath '%LOGFILE%' -Value $_ -Encoding utf8 }"
 
 set RC=%ERRORLEVEL%
 copy /Y "%LOGFILE%" last_run_chrome.log >nul 2>&1

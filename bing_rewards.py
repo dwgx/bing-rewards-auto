@@ -250,6 +250,15 @@ def classify(aria: str, href: str) -> str:
 
 async def discover_cards(page: Page) -> list[Card]:
     cards: list[Card] = []
+    # Trigger lazy-loaded sections (More activities only renders after a scroll).
+    try:
+        for y in (400, 1200, 2400, 3600):
+            await page.evaluate(f"window.scrollTo(0, {y})")
+            await page.wait_for_timeout(400)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(700)
+    except Exception:
+        pass
     anchors = page.locator("a[aria-label]")
     count = await anchors.count()
     for i in range(count):
@@ -413,9 +422,19 @@ async def do_open_only(ctx: BrowserContext, dashboard: Page, card: Card) -> bool
 
 
 async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
-    """3-question multiple choice. We iterate: pick the option whose href carries WQSCORE:1."""
+    """3-to-10-question multiple choice. Pick the option whose URL has WQSCORE:1.
+
+    Hardened: stops on stale tabs / detached locators / context death so a single
+    bad quiz can't take the whole run down with it. Returns True if at least one
+    answer was clicked (which already credits partial points)."""
     log(f"  -> quiz: {card.title} ({card.points}p)")
-    tab = await ctx.new_page()
+    try:
+        tab = await ctx.new_page()
+    except Exception as e:
+        log(f"     could not open quiz tab: {e}")
+        return False
+    answered = 0
+    consecutive_misses = 0
     try:
         await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
         await tab.wait_for_timeout(3500)
@@ -425,51 +444,74 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
                 await tab.get_by_role("button", name=re.compile("Accept|同意|同意する", re.I)).click(timeout=1500)
             except Exception:
                 break
-        # Loop through up to 10 questions (safety cap; usual is 3).
-        for qi in range(10):
-            # Correct answer link pattern: URL contains WQSCORE%3A%221%22.
+        # Iterate up to 12 question rounds (max real quiz is ~10).
+        for qi in range(12):
+            if tab.is_closed():
+                log(f"     tab closed before q{qi + 1}; stopping.")
+                break
+            # Find the correct-answer link.
             target = None
-            for selector in [
-                'a[href*="WQSCORE%3A%221%22"]',
-                'a[href*="WQSCORE%3A%221%22"][aria-disabled="false"]',
-            ]:
-                loc = tab.locator(selector)
-                if await loc.count() > 0:
-                    target = loc.first
-                    break
-            if target is None:
-                # Fallback: any quiz option link.
-                options = tab.locator('a[href*="WQCI"]')
-                if await options.count() == 0:
-                    log(f"     no more question options at q{qi + 1}; done.")
-                    break
-                target = options.first
-            # Scroll into view and click (quiz answers can be below the fold).
             try:
-                await target.scroll_into_view_if_needed(timeout=5000)
+                for selector in [
+                    'a[href*="WQSCORE%3A%221%22"]',
+                    'a[href*="WQCI"]',  # any option as fallback
+                ]:
+                    loc = tab.locator(selector)
+                    if await loc.count() > 0:
+                        target = loc.first
+                        break
+            except Exception as e:
+                log(f"     locator query died at q{qi + 1}: {type(e).__name__}; stopping.")
+                break
+            if target is None:
+                consecutive_misses += 1
+                if consecutive_misses >= 2:
+                    log(f"     no options at q{qi + 1} (twice); quiz complete or unreachable.")
+                    break
+                await tab.wait_for_timeout(2000)
+                continue
+            consecutive_misses = 0
+            # Scroll & click.
+            try:
+                await target.scroll_into_view_if_needed(timeout=4000)
             except Exception:
                 pass
+            clicked = False
             try:
-                await target.click(timeout=10_000)
+                await target.click(timeout=8000)
+                clicked = True
             except Exception:
-                # Force-click via JS if the element is obscured by overlays.
+                # JS fallback for obscured/animated elements.
                 try:
                     await target.evaluate("el => el.click()")
-                except Exception:
-                    log(f"     could not click q{qi + 1} option; skipping.")
-                    break
+                    clicked = True
+                except Exception as e:
+                    msg = str(e)
+                    if "closed" in msg.lower() or "detached" in msg.lower():
+                        log(f"     tab/context closed during q{qi + 1}; stopping.")
+                        break
+                    log(f"     could not click q{qi + 1}: {type(e).__name__}; trying next.")
+            if not clicked:
+                continue
+            answered += 1
+            # Wait for navigation (clicking answer triggers a page change).
             try:
-                await tab.wait_for_load_state("domcontentloaded", timeout=15_000)
+                await tab.wait_for_load_state("domcontentloaded", timeout=12_000)
             except PWTimeout:
                 pass
-            await jitter(2, 3.5)
-        return True
+            except Exception:
+                # Likely a context error — bail.
+                log(f"     wait_for_load died at q{qi + 1}; stopping.")
+                break
+            await jitter(2.5, 4.0)
+        return answered > 0
     except Exception as e:
-        log(f"     failed: {e}")
-        return False
+        log(f"     quiz outer error ({answered} answered): {type(e).__name__}: {e}")
+        return answered > 0
     finally:
         try:
-            await tab.close()
+            if not tab.is_closed():
+                await tab.close()
         except Exception:
             pass
 
@@ -724,12 +766,51 @@ async def read_points(page: Page) -> tuple[Optional[int], Optional[int]]:
         return None, None
 
 
-async def goto_rewards(page: Page) -> None:
-    await page.goto(REWARDS_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(1800)
+async def goto_rewards(page: Page) -> bool:
+    """Reload dashboard. Returns False if the page/context is dead."""
+    try:
+        await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=30_000)
+    except Exception as e:
+        log(f"  goto_rewards failed: {type(e).__name__}: {str(e)[:120]}")
+        return False
+    # Slower wait + a scroll triggers the dashboard's lazy-loaded card lists.
+    try:
+        await page.wait_for_timeout(3500)
+        await page.mouse.wheel(0, 600)
+        await page.wait_for_timeout(800)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
+    return True
+
+
+async def is_context_alive(ctx: BrowserContext) -> bool:
+    try:
+        # Cheap probe: just create and close a blank page.
+        p = await ctx.new_page()
+        await p.close()
+        return True
+    except Exception:
+        return False
 
 
 # ---- main loop -----------------------------------------------------------
+
+async def _open_browser(p, headless: bool):
+    """Launch a fresh browser + context + dashboard page, fully isolated from any
+    dead predecessor. Returns (browser, ctx, page)."""
+    browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=headless)
+    ctx = await browser.new_context(
+        storage_state=str(AUTH_FILE),
+        user_agent=DESKTOP_UA,
+        viewport={"width": 1280, "height": 860},
+        locale="en-US",
+    )
+    page = await ctx.new_page()
+    await goto_rewards(page)
+    return browser, ctx, page
+
 
 async def main_run(headless: bool) -> None:
     if not AUTH_FILE.exists():
@@ -737,18 +818,24 @@ async def main_run(headless: bool) -> None:
         sys.exit(2)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=headless)
-        ctx = await browser.new_context(
-            storage_state=str(AUTH_FILE),
-            user_agent=DESKTOP_UA,
-            viewport={"width": 1280, "height": 860},
-            locale="en-US",
-        )
-        page = await ctx.new_page()
+        browser, ctx, page = await _open_browser(p, headless)
 
-        await goto_rewards(page)
+        async def ensure_alive():
+            """If the context has died (e.g. quiz triggered a tab close that took
+            it down), tear down and relaunch so the rest of the run can proceed."""
+            nonlocal browser, ctx, page
+            if await is_context_alive(ctx):
+                return
+            log("  ** context died — relaunching browser to continue **")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            browser, ctx, page = await _open_browser(p, headless)
+
         avail_before, today_before = await read_points(page)
         log(f"Before: available={avail_before} today={today_before}")
+        await goto_rewards(page)
 
         cards = await discover_cards(page)
         log(f"Discovered {len(cards)} earnable cards:")
@@ -766,18 +853,23 @@ async def main_run(headless: bool) -> None:
                 done = await handler(ctx, page, c)
                 ok += int(bool(done))
                 failed += int(not done)
-                await goto_rewards(page)
-                await jitter(1, 2)
             except Exception as e:
-                log(f"  !! error on {c.title}: {e}")
+                log(f"  !! error on {c.title}: {type(e).__name__}: {str(e)[:120]}")
                 failed += 1
+            await ensure_alive()
+            try:
+                await goto_rewards(page)
+            except Exception:
+                await ensure_alive()
+            await jitter(1, 2)
 
-        # Bonus tasks before the search marathon: Copilot prompt sometimes credits
-        # 5-10p as a daily activity reward.
+        # Copilot prompt — daily Copilot activity sometimes credits 5-15p.
+        await ensure_alive()
         try:
             await do_copilot_prompt(ctx)
         except Exception as e:
-            log(f"  copilot prompt skipped: {e}")
+            log(f"  copilot prompt skipped: {type(e).__name__}: {str(e)[:120]}")
+            await ensure_alive()
 
         # PC / Mobile quotas (+ human-style searches for the "100 extra points/day" bonus)
         pc_e, pc_c, mo_e, mo_c = await search_quota_status(page)
@@ -791,8 +883,13 @@ async def main_run(headless: bool) -> None:
         # Second sweep: some "Explore on Bing" / Daily-set cards unlock only after
         # finishing earlier ones. Re-scan and try the new ones.
         log("Second sweep for newly-unlocked cards...")
-        await goto_rewards(page)
-        new_cards = await discover_cards(page)
+        await ensure_alive()
+        try:
+            await goto_rewards(page)
+            new_cards = await discover_cards(page)
+        except Exception as e:
+            log(f"  second sweep discovery failed: {e}")
+            new_cards = []
         new_only = [c for c in new_cards if (c.title, c.href) not in {(x.title, x.href) for x in cards}]
         if new_only:
             log(f"  found {len(new_only)} new card(s) after first pass:")
@@ -807,11 +904,15 @@ async def main_run(headless: bool) -> None:
                         ok += 1
                     else:
                         failed += 1
-                    await goto_rewards(page)
-                    await jitter(1, 2)
                 except Exception as e:
-                    log(f"    !! error on {c.title}: {e}")
+                    log(f"    !! error on {c.title}: {type(e).__name__}: {str(e)[:120]}")
                     failed += 1
+                await ensure_alive()
+                try:
+                    await goto_rewards(page)
+                except Exception:
+                    await ensure_alive()
+                await jitter(1, 2)
         else:
             log("  no new cards.")
 

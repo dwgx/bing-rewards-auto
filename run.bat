@@ -42,7 +42,7 @@ echo.
 call .venv\Scripts\activate.bat
 
 rem Stream output to console AND log file. -u flag forces unbuffered Python.
-.venv\Scripts\python -u bing_rewards.py %PYARGS% 2>&1 | powershell -NoProfile -Command "$input | Tee-Object -FilePath '%LOGFILE%'"
+.venv\Scripts\python -u bing_rewards.py %PYARGS% 2>&1 | powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $input | ForEach-Object { Write-Host $_; Add-Content -LiteralPath '%LOGFILE%' -Value $_ -Encoding utf8 }"
 
 set RC=%ERRORLEVEL%
 copy /Y "%LOGFILE%" last_run.log >nul 2>&1
