@@ -9,12 +9,6 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-if not exist "auth.json" (
-  echo [ERROR] auth.json missing. Run setup.bat first to log in.
-  pause
-  exit /b 1
-)
-
 if not exist logs mkdir logs
 
 rem Strip --quiet (used by Task Scheduler) from args before forwarding to Python.
@@ -41,8 +35,39 @@ echo.
 
 call .venv\Scripts\activate.bat
 
+set RUN_BROWSER=msedge
+
+if not exist "auth_msedge.json" if not exist "auth.json" (
+  if exist "auth_chromium.json" (
+    echo [setup] using existing Chromium auth because no Edge auth file was found.
+    set RUN_BROWSER=chromium
+  ) else (
+    echo [setup] no Edge auth file found. Importing your existing Edge profile...
+    .venv\Scripts\python -u bing_rewards.py --import-profile
+    if errorlevel 1 (
+      echo [setup] To reuse your already-open Edge login, run import-edge-cookies.bat.
+      echo [setup] Edge profile import failed. Launching first-time Edge login...
+      .venv\Scripts\python -u bing_rewards.py --login
+      if errorlevel 1 (
+        echo [setup] Edge login failed. Falling back to Playwright Chromium...
+        .venv\Scripts\python -u bing_rewards.py --login --browser chromium
+        if errorlevel 1 (
+          echo [ERROR] login failed. Complete Microsoft sign-in in the browser window and rerun.
+          pause
+          exit /b 1
+        )
+        set RUN_BROWSER=chromium
+      )
+    )
+  )
+)
+
 rem Stream output to console AND log file. -u flag forces unbuffered Python.
-.venv\Scripts\python -u bing_rewards.py %PYARGS% 2>&1 | powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $input | ForEach-Object { Write-Host $_; Add-Content -LiteralPath '%LOGFILE%' -Value $_ -Encoding utf8 }"
+if "%RUN_BROWSER%"=="chromium" (
+  .venv\Scripts\python -u bing_rewards.py --browser chromium %PYARGS% 2>&1 | powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $input | ForEach-Object { Write-Host $_; Add-Content -LiteralPath '%LOGFILE%' -Value $_ -Encoding utf8 }"
+) else (
+  .venv\Scripts\python -u bing_rewards.py %PYARGS% 2>&1 | powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $input | ForEach-Object { Write-Host $_; Add-Content -LiteralPath '%LOGFILE%' -Value $_ -Encoding utf8 }"
+)
 
 set RC=%ERRORLEVEL%
 copy /Y "%LOGFILE%" last_run.log >nul 2>&1

@@ -10,6 +10,7 @@ auth_*.json
 # Logs
 last_run.log
 last_run_chrome.log
+last_run_chromium.log
 logs/
 
 # Debug screenshots from interactive testing

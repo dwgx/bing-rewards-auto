@@ -9,12 +9,6 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-if not exist "auth_chrome.json" if not exist "auth.json" (
-  echo [ERROR] no auth file found. Run setup-chrome.bat first to log in.
-  pause
-  exit /b 1
-)
-
 if not exist logs mkdir logs
 
 rem Strip --quiet (used by Task Scheduler) from args before forwarding to Python.
@@ -39,6 +33,21 @@ echo Log: %LOGFILE%
 echo.
 
 call .venv\Scripts\activate.bat
+
+if not exist "auth_chrome.json" if not exist "auth.json" (
+  echo [setup] no Chrome auth file found. Importing your existing Chrome profile...
+  .venv\Scripts\python -u bing_rewards.py --import-profile --browser chrome
+  if errorlevel 1 (
+    echo [setup] Chrome profile import failed. Launching first-time login...
+    .venv\Scripts\python -u bing_rewards.py --login --browser chrome
+    if errorlevel 1 (
+      echo [ERROR] login failed. Run setup-chrome.bat and complete Microsoft sign-in.
+      pause
+      exit /b 1
+    )
+  )
+)
+
 .venv\Scripts\python -u bing_rewards.py --browser chrome %PYARGS% 2>&1 | powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $input | ForEach-Object { Write-Host $_; Add-Content -LiteralPath '%LOGFILE%' -Value $_ -Encoding utf8 }"
 
 set RC=%ERRORLEVEL%

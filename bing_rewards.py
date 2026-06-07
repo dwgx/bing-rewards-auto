@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import random
 import re
 import sys
@@ -143,29 +145,138 @@ async def jitter(lo: float = 0.8, hi: float = 2.2) -> None:
     await asyncio.sleep(random.uniform(lo, hi))
 
 
+async def launch_browser(p, *, headless: bool, args: Optional[list[str]] = None):
+    launch_args = {"headless": headless}
+    if args:
+        launch_args["args"] = args
+    if BROWSER_CHANNEL != "chromium":
+        launch_args["channel"] = BROWSER_CHANNEL
+    return await p.chromium.launch(**launch_args)
+
+
+def browser_user_data_dir(browser: str) -> Path:
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    if browser == "msedge":
+        return local / "Microsoft" / "Edge" / "User Data"
+    if browser == "chrome":
+        return local / "Google" / "Chrome" / "User Data"
+    raise ValueError(f"{browser} does not have a system profile directory")
+
+
+def default_profile_dir(user_data_dir: Path) -> str:
+    local_state = user_data_dir / "Local State"
+    try:
+        data = json.loads(local_state.read_text(encoding="utf-8"))
+        return data.get("profile", {}).get("last_used") or "Default"
+    except Exception:
+        return "Default"
+
+
+async def import_existing_profile(profile_dir: Optional[str]) -> None:
+    if BROWSER_CHANNEL not in {"msedge", "chrome"}:
+        raise RuntimeError("--import-profile supports --browser msedge or --browser chrome")
+
+    user_data_dir = browser_user_data_dir(BROWSER_CHANNEL)
+    profile = profile_dir or default_profile_dir(user_data_dir)
+    if not (user_data_dir / profile).exists():
+        raise RuntimeError(f"profile not found: {user_data_dir / profile}")
+
+    log(f"Importing cookies from {BROWSER_CHANNEL} profile '{profile}'.")
+    log(f"If this fails, close all {BROWSER_CHANNEL} windows and rerun the import.")
+    async with async_playwright() as p:
+        try:
+            ctx = await p.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                channel=BROWSER_CHANNEL,
+                headless=True,
+                args=[f"--profile-directory={profile}"],
+                viewport={"width": 1280, "height": 860},
+                locale="en-US",
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"could not open the existing {BROWSER_CHANNEL} profile. "
+                f"Close all {BROWSER_CHANNEL} windows and retry. ({type(e).__name__}: {e})"
+            ) from e
+        try:
+            page = await ctx.new_page()
+            await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(3000)
+            log(f"Rewards URL after import probe: {page.url}")
+            await page.goto("https://www.bing.com/", wait_until="domcontentloaded", timeout=15_000)
+            await ctx.storage_state(path=str(AUTH_FILE))
+            cookies = [c["name"] for c in (await ctx.cookies()) if "bing.com" in c.get("domain", "")]
+            logged_in = any(n in cookies for n in ["_U", "_C_Auth", "SRCHUSR"])
+            log(f"Saved auth state -> {AUTH_FILE}")
+            log(f"Import check: {'OK' if logged_in else 'WEAK'} (bing cookies: {len(cookies)})")
+            if "login." in page.url or "/welcome" in page.url:
+                log("Profile opened, but Rewards still looks signed out. Use --login if the saved auth does not work.")
+        finally:
+            await ctx.close()
+
+
+async def import_from_cdp(cdp_url: str) -> None:
+    log(f"Importing cookies from running browser at {cdp_url}.")
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(cdp_url)
+        contexts = browser.contexts
+        if not contexts:
+            raise RuntimeError(f"connected to {cdp_url}, but no browser context was available")
+        ctx = contexts[0]
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(3000)
+        log(f"Rewards URL after CDP probe: {page.url}")
+        try:
+            await page.goto("https://www.bing.com/", wait_until="domcontentloaded", timeout=15_000)
+        except Exception:
+            pass
+        await ctx.storage_state(path=str(AUTH_FILE))
+        cookies = [c["name"] for c in (await ctx.cookies()) if "bing.com" in c.get("domain", "")]
+        logged_in = any(n in cookies for n in ["_U", "_C_Auth", "SRCHUSR"])
+        log(f"Saved auth state -> {AUTH_FILE}")
+        log(f"CDP import check: {'OK' if logged_in else 'WEAK'} (bing cookies: {len(cookies)})")
+        if "login." in page.url or "/welcome" in page.url:
+            log("Connected browser still looks signed out for Rewards. Open Rewards in Edge and confirm the account.")
+
+
 # ---- first-time login ----------------------------------------------------
 
 async def first_time_login() -> None:
     log(f"Opening {BROWSER_CHANNEL}. Sign in to your Microsoft account in the browser window.")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=False, args=["--start-maximized"])
+        browser = await launch_browser(p, headless=False, args=["--start-maximized"])
         ctx = await browser.new_context(viewport={"width": 1280, "height": 860})
         page = await ctx.new_page()
         # Go to rewards.bing.com — it will redirect to login or /welcome if not signed in.
-        await page.goto(REWARDS_URL, wait_until="networkidle")
+        await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=30_000)
         await page.wait_for_timeout(3000)
         log(f"Landed on: {page.url}")
+        if "/welcome" in page.url:
+            log("On the welcome page; opening the sign-in flow...")
+            for label in ["Start earning", "Sign in"]:
+                clicked = False
+                for role in ["link", "button"]:
+                    try:
+                        await page.get_by_role(role, name=re.compile(label, re.I)).first.click(timeout=3000)
+                        clicked = True
+                        await page.wait_for_timeout(3000)
+                        break
+                    except Exception:
+                        pass
+                if clicked:
+                    break
         # If already on the dashboard (user was logged in via Edge profile), we're done.
         # Otherwise wait for the user to sign in.
         needs_login = "/welcome" in page.url or "login." in page.url
         if needs_login:
-            log("Not logged in. Please sign in in the browser window (up to 10 min)...")
+            log("Not logged in. Please sign in in the browser window. Do not close it until this script saves auth.")
             try:
                 await page.wait_for_url(
                     lambda u: "rewards.bing.com" in u and "/welcome" not in u and "login." not in u,
                     timeout=600_000,
                 )
-                await page.wait_for_load_state("networkidle", timeout=30_000)
+                await page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except PWTimeout:
                 pass
         else:
@@ -183,13 +294,13 @@ async def first_time_login() -> None:
         # Make sure we land on the dashboard.
         if "rewards.bing.com" not in page.url or "/welcome" in page.url:
             try:
-                await page.goto(REWARDS_URL, wait_until="networkidle", timeout=30_000)
+                await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=30_000)
             except PWTimeout:
                 pass
         # Also hit bing.com to pick up search cookies.
         try:
-            await page.goto("https://www.bing.com/", wait_until="networkidle", timeout=15_000)
-        except PWTimeout:
+            await page.goto("https://www.bing.com/", wait_until="domcontentloaded", timeout=15_000)
+        except Exception:
             pass
         await ctx.storage_state(path=str(AUTH_FILE))
         log(f"Saved auth state -> {AUTH_FILE}")
@@ -699,7 +810,7 @@ async def run_search_quota(p, label: str, ua: str, cap: int, extra: int = 0) -> 
     bonus_n = extra
     log(f"  -> {label} searches: {fast_n} fast + {bonus_n} human (cap={cap}p, bonus={bonus_n})")
 
-    browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=True)
+    browser = await launch_browser(p, headless=True)
     try:
         viewport = {"width": 412, "height": 915} if "Mobile" in ua else {"width": 1280, "height": 860}
         ctx = await browser.new_context(
@@ -800,7 +911,7 @@ async def is_context_alive(ctx: BrowserContext) -> bool:
 async def _open_browser(p, headless: bool):
     """Launch a fresh browser + context + dashboard page, fully isolated from any
     dead predecessor. Returns (browser, ctx, page)."""
-    browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=headless)
+    browser = await launch_browser(p, headless=headless)
     ctx = await browser.new_context(
         storage_state=str(AUTH_FILE),
         user_agent=DESKTOP_UA,
@@ -940,9 +1051,15 @@ def cli() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--login", action="store_true",
                     help="First-time interactive login; saves auth.json")
+    ap.add_argument("--import-profile", action="store_true",
+                    help="Import auth from the existing Edge/Chrome profile for this Windows user")
+    ap.add_argument("--import-cdp", default=None,
+                    help="Import auth from a running browser with remote debugging, e.g. http://127.0.0.1:9222")
+    ap.add_argument("--profile-dir", default=None,
+                    help="Profile directory to import, e.g. Default or 'Profile 1' (default: browser last_used)")
     ap.add_argument("--show", action="store_true",
                     help="Run non-headless (useful for debugging)")
-    ap.add_argument("--browser", choices=["msedge", "chrome"], default="msedge",
+    ap.add_argument("--browser", choices=["msedge", "chrome", "chromium"], default="msedge",
                     help="Which Playwright channel to drive (default: msedge)")
     ap.add_argument("--auth-file", default=None,
                     help="Path to the auth.json (default: auth_<browser>.json, falls back to auth.json)")
@@ -967,7 +1084,11 @@ def cli() -> None:
     log("=" * 60)
     log(f"START  browser={BROWSER_CHANNEL} auth={AUTH_FILE.name} args={vars(args)}")
     try:
-        if args.login:
+        if args.import_cdp:
+            asyncio.run(import_from_cdp(args.import_cdp))
+        elif args.import_profile:
+            asyncio.run(import_existing_profile(args.profile_dir))
+        elif args.login:
             asyncio.run(first_time_login())
         else:
             asyncio.run(main_run(headless=not args.show))

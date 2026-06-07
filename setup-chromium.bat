@@ -19,16 +19,14 @@ if not exist ".venv\" (
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m playwright install chrome 2>nul
+python -m playwright install chromium
 
 echo.
-echo [setup] importing your existing Chrome Microsoft login...
-python bing_rewards.py --import-profile --browser chrome
-if errorlevel 1 (
-  echo [setup] profile import failed. Launching first-time Chrome login...
-  python bing_rewards.py --login --browser chrome
-)
+echo [setup] launching first-time login in Playwright Chromium.
+echo         Sign in to your Microsoft account, then keep the browser open
+echo         until this script saves auth_chromium.json.
+python bing_rewards.py --login --browser chromium
 
 echo.
-echo [setup] done. Use run-chrome.bat for daily Chrome runs.
+echo [setup] done. Use run-chromium.bat for daily Chromium runs.
 pause

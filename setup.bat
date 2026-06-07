@@ -1,6 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -22,8 +24,12 @@ rem But Playwright still needs its runtime files:
 python -m playwright install-deps 2>nul
 
 echo.
-echo [setup] launching first-time login in your Edge. Sign in, then close the browser.
-python bing_rewards.py --login
+echo [setup] importing your existing Edge Microsoft login...
+python bing_rewards.py --import-profile
+if errorlevel 1 (
+  echo [setup] profile import failed. Launching first-time Edge login...
+  python bing_rewards.py --login
+)
 
 echo.
 echo [setup] done. Use run.bat daily, or schtasks /create to schedule.

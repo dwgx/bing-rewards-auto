@@ -1,6 +1,6 @@
 # Bing Rewards 自动签到
 
-每天自动扫 `rewards.bing.com` 上所有还能领的积分任务。**支持 Edge 和 Chrome 两套浏览器**，可独立各一份登录态、独立运行。
+每天自动扫 `rewards.bing.com` 上所有还能领的积分任务。**支持 Edge、Chrome 和 Playwright Chromium**，可独立各一份登录态、独立运行。
 
 ## 自动识别的任务
 
@@ -32,13 +32,23 @@
 
 前置：Python 3.10+ + Microsoft **Edge** 或 **Chrome**（任一即可，两者都装也行）。
 
+`setup*.bat` 会先尝试复用你当前 Windows 用户的浏览器 profile 登录态，导出到 `auth_*.json`。如果浏览器 profile 正在被打开的浏览器锁住，会自动退回到交互式登录。
+
 ### Edge 版
 
 ```
 双击 setup.bat
 ```
 
-弹出 Edge 让你登一次，登完后页面会自动跳到 rewards dashboard，cookie 存到 `auth_msedge.json`。
+优先从当前 Edge profile 导入登录态，成功后 cookie 存到 `auth_msedge.json`。如果导入失败，会弹出 Edge 让你登一次。
+
+如果你 Edge 已经登录 Microsoft，但导入时提示 profile 被占用：
+
+```
+双击 import-edge-cookies.bat
+```
+
+它会让你关闭所有 Edge 窗口，然后用同一个 Edge profile 带调试端口重新打开 Rewards，并导出 `auth_msedge.json`。
 
 ### Chrome 版
 
@@ -48,6 +58,14 @@
 
 同上，但用 Chrome 登录，cookie 存到 `auth_chrome.json`。
 
+### Chromium 兜底
+
+```
+双击 setup-chromium.bat
+```
+
+使用 Playwright 自带 Chromium 登录，cookie 存到 `auth_chromium.json`。适合本机 Edge/Chrome channel 被策略、崩溃或 profile 锁挡住时使用。
+
 > 两套 auth 文件互不干扰；想用哪边跑就执行对应的 `run-*.bat`。
 
 ## 日常运行
@@ -55,7 +73,10 @@
 ```
 双击 run.bat            ← Edge
 双击 run-chrome.bat     ← Chrome
+双击 run-chromium.bat   ← Playwright Chromium
 ```
+
+如果 `run.bat` 找不到 Edge 登录态，会先尝试导入 Edge profile；导入失败时会提示你使用 `import-edge-cookies.bat`，再退回交互登录或 Chromium 兜底。
 
 控制台会实时显示进度，同时写入 `logs/run_YYYYMMDD_HHMMSS.log`（每次一份带时间戳）+ `last_run.log`（最近一次的副本）。跑完按任意键关窗，60 秒不操作自动关。
 
@@ -95,10 +116,11 @@ schtasks /delete /tn "BingRewardsEdge" /f
 | 文件 | 作用 |
 |---|---|
 | `bing_rewards.py` | 主脚本，支持 `--browser msedge|chrome` |
-| `setup.bat` / `setup-chrome.bat` | 首次装依赖 + 登录 |
-| `run.bat` / `run-chrome.bat` | 日常跑（带日志/暂停） |
+| `setup.bat` / `setup-chrome.bat` / `setup-chromium.bat` | 首次装依赖 + 导入/登录 |
+| `run.bat` / `run-chrome.bat` / `run-chromium.bat` | 日常跑（带日志/暂停） |
+| `import-edge-cookies.bat` | 从现有 Edge profile/CDP 导出 `auth_msedge.json` |
 | `requirements.txt` | Python 依赖（仅需 playwright） |
-| `auth_msedge.json` / `auth_chrome.json` | 登录 state（脚本生成，**禁止外传**） |
+| `auth_msedge.json` / `auth_chrome.json` / `auth_chromium.json` | 登录 state（脚本生成，**禁止外传**） |
 | `logs/run_*.log` | 每次运行的完整日志 |
 | `last_run.log` | 最近一次的日志副本 |
 | `.gitignore` | 防 auth/log 被提交 |
@@ -108,6 +130,10 @@ schtasks /delete /tn "BingRewardsEdge" /f
 ```
 python bing_rewards.py --show                      # 不无头跑，看浏览器实际操作
 python bing_rewards.py --browser chrome --show     # Chrome 版可视化
+python bing_rewards.py --browser chromium --show   # Chromium 兜底版可视化
+python bing_rewards.py --import-profile            # 从当前 Edge profile 导入 auth_msedge.json
+python bing_rewards.py --import-profile --browser chrome
+python bing_rewards.py --import-cdp http://127.0.0.1:9222
 python bing_rewards.py --auth-file path/to/x.json  # 自定义 auth 路径
 ```
 
