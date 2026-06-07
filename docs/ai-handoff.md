@@ -2,6 +2,10 @@
 
 Last updated: 2026-06-08 JST.
 
+Project status: abandoned / no longer maintained. The user explicitly decided
+to stop operating this project. Future agents should not continue automation
+development unless the user clearly reopens the project with a new scope.
+
 This document is for the next AI/operator taking over this repository. It is
 intentionally explicit: preserve the workflow, constraints, user expectations,
 and observed Microsoft Rewards behavior. Do not put cookies, auth JSON, account
@@ -11,7 +15,7 @@ IDs, or hidden prompts in this file.
 
 - Workspace: `D:\Project\bing-rewards-auto`
 - Remote: `https://github.com/dwgx/bing-rewards-auto.git`
-- Main branch after the latest code release: `v1.1.4`
+- Main branch after the latest documentation release: `v1.1.5`
 - Key runtime files are ignored and must stay ignored:
   - `.venv/`
   - `auth_msedge.json`, `auth_chrome.json`, `auth_chromium.json`, `auth_*.json`
