@@ -34,9 +34,10 @@ Flow:
    - `POST https://www.bing.com/rewardsapp/reportActivity?...form=ML2PCR...rwAutoFlyout=exb...`
    - `GET https://www.bing.com/rewardsapp/flyout?...rwAutoFlyout=exb`
 
-Plainly typing in the Bing search box after the card click can lose this Rewards
-context, so the implementation uses the clicked card's Rewards URL parameters
-when completing the search.
+The implementation now keeps the tab opened by the visible Rewards card click
+and types the inferred topic into the Bing search box. The card's own URL still
+has to carry `form=ML2PCR` / `rwAutoFlyout=exb`; final success is not inferred
+from the request alone.
 
 Recent trace results:
 
@@ -44,10 +45,28 @@ Recent trace results:
   but available/today points stayed `8510/27`.
 - `00:52:47`, second Explore card: card click and `reportActivity` succeeded,
   but available/today points stayed `8510/27`.
+- `02:00:54`, visible Explore card was tried after the dashboard quiz completed;
+  no points/card-state change was detected, so the run safety-stopped.
 
 Interpretation: the protocol was followed, but the account did not receive more
 points for these repeated Explore cards during this session. The safe behavior is
 to stop instead of retrying.
+
+## Dashboard daily activities
+
+Observed on 2026-06-08.
+
+- The dashboard "每日活动" section is a collapsed disclosure. Its child links exist
+  in the DOM while the panel height is `0`, so automation must first expand the
+  visible disclosure button and only then act on visible links.
+- Some visible dashboard daily search links contain `rnoreward=1`; these can be
+  already-completed/display-only links and are filtered out as non-earnable.
+- The remaining `form=dsetqu` Bing quiz used standard `.btq_opt` answer links.
+  Correct choices were identified from the highest cumulative `WQSCORE` on the
+  currently visible question card, then the visible "下一个" button advanced the
+  quiz.
+- Result on this account: available/today increased `9366/880 -> 9376/890`, and
+  `/earn` progress moved to `活动: 1/3`.
 
 ## Daily streak and Bing app check-in
 

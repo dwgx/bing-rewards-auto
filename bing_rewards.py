@@ -442,6 +442,49 @@ def points_delta(before: tuple[Optional[int], Optional[int]],
     return False, "no points increase detected"
 
 
+async def read_bing_header_points(page: Page) -> Optional[int]:
+    """Read the Bing SERP rewards medallion when the current page is already on Bing."""
+    try:
+        if "bing.com" not in urlparse(page.url).netloc.lower():
+            return None
+    except Exception:
+        return None
+    for selector in ("#rh_rwm", ".kumo_rewards", ".medallion"):
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() == 0:
+                continue
+            value = parse_int(await loc.text_content(timeout=1200))
+            if value is not None and value >= 100:
+                return value
+        except Exception:
+            continue
+    try:
+        body = await page.locator("body").inner_text(timeout=2500)
+    except Exception:
+        return None
+    lines = [clean_text(line) for line in body.splitlines()]
+    lines = [line for line in lines if line]
+    for line in lines[:16]:
+        if re.fullmatch(r"\d[\d,]{2,}", line):
+            value = parse_int(line)
+            if value is not None and 100 <= value <= 10_000_000:
+                return value
+    return None
+
+
+async def remember_bing_header_points(target: Page, source: Page) -> Optional[int]:
+    points = await read_bing_header_points(source)
+    if points is not None:
+        try:
+            prior = getattr(target, "_last_bing_available", None)
+            if prior is None or points > prior:
+                setattr(target, "_last_bing_available", points)
+        except Exception:
+            pass
+    return points
+
+
 def title_from_text(text: str) -> str:
     text = clean_text(text)
     if not text:
@@ -537,6 +580,13 @@ async def _collect_card_candidates(page: Page) -> list[dict]:
                 if (role) return `${el.tagName.toLowerCase()}[role="${cssEscape(role)}"]`;
                 return el.tagName.toLowerCase();
             };
+            const visible = (el) => {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && r.bottom > 0 && r.top < innerHeight
+                    && r.right > 0 && r.left < innerWidth
+                    && st.display !== 'none' && st.visibility !== 'hidden';
+            };
             const elements = new Set([
                 ...document.querySelectorAll('a[href], a[aria-label], button, [role="button"], [role="link"]'),
                 ...document.querySelectorAll('[data-bi-id], [data-m], [data-testid], [aria-label*="point" i], [aria-label*="earn" i]')
@@ -544,6 +594,7 @@ async def _collect_card_candidates(page: Page) -> list[dict]:
             const out = [];
             for (const el of elements) {
                 const clickable = el.closest('a[href], button, [role="button"], [role="link"]') || el;
+                if (!visible(clickable)) continue;
                 const href = clickable.getAttribute('href') || el.getAttribute('href') || '';
                 const aria = clickable.getAttribute('aria-label') || el.getAttribute('aria-label') || '';
                 const text = clean([aria, clickable.innerText, el.innerText, clickable.getAttribute('title'), el.getAttribute('title')].filter(Boolean).join(' '));
@@ -628,6 +679,131 @@ async def discover_cards_legacy(page: Page) -> list[Card]:
     return uniq
 
 
+async def expand_dashboard_daily_section(page: Page) -> None:
+    """Open the dashboard Daily activities disclosure so its task links are visible."""
+    try:
+        if "/dashboard" not in urlparse(page.url).path:
+            return
+    except Exception:
+        return
+    try:
+        await page.evaluate("window.scrollTo(0, 1000)")
+        await page.wait_for_timeout(600)
+    except Exception:
+        pass
+    try:
+        button = await page.evaluate_handle(
+            """() => {
+                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    return r.width > 4 && r.height > 4 && r.bottom > 0 && r.top < innerHeight
+                        && r.right > 0 && r.left < innerWidth
+                        && st.display !== 'none' && st.visibility !== 'hidden';
+                };
+                return [...document.querySelectorAll('button[aria-expanded="false"][aria-controls]')]
+                    .find((el) => visible(el) && clean(el.getAttribute('aria-label') || el.innerText || el.textContent) === '每日活动')
+                    || [...document.querySelectorAll('button[aria-expanded="false"][aria-controls]')]
+                    .find((el) => visible(el) && /Daily activities|Daily activity/i.test(clean(el.getAttribute('aria-label') || el.innerText || el.textContent)))
+                    || null;
+            }"""
+        )
+        element = button.as_element()
+        if element is not None:
+            await element.click(timeout=5000)
+            await page.wait_for_timeout(700)
+    except Exception:
+        pass
+
+
+async def discover_dashboard_daily_cards(page: Page) -> list[Card]:
+    """Collect the dashboard daily activity links that live inside carousel/panel sections."""
+    try:
+        for y in (0, 650, 950, 1200):
+            await page.evaluate(f"window.scrollTo(0, {y})")
+            await page.wait_for_timeout(500)
+        await expand_dashboard_daily_section(page)
+    except Exception:
+        pass
+    try:
+        items = await page.evaluate(
+            """() => {
+                const clean = (s) => (s || '').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g, '').replace(/\\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    return r.width > 4 && r.height > 4 && r.bottom > 0 && r.top < innerHeight
+                        && r.right > 0 && r.left < innerWidth
+                        && st.display !== 'none' && st.visibility !== 'hidden';
+                };
+                const cssEscape = (value) => {
+                    if (window.CSS && CSS.escape) return CSS.escape(value);
+                    return String(value).replace(/["\\\\]/g, '\\\\$&');
+                };
+                const selectorFor = (el) => {
+                    const href = el.getAttribute('href') || '';
+                    if (href) return `a[href="${cssEscape(href)}"]`;
+                    return 'a[href]';
+                };
+                return [...document.querySelectorAll('a[href]')].map((el) => ({
+                    href: el.getAttribute('href') || '',
+                    text: clean([el.getAttribute('aria-label'), el.innerText, el.textContent, el.getAttribute('title')].filter(Boolean).join(' ')),
+                    selector: selectorFor(el),
+                    visible: visible(el)
+                })).filter((x) => {
+                    const h = x.href.toLowerCase();
+                    const t = x.text.toLowerCase();
+                    return (
+                        h.includes('rewardsquiz_dailyset')
+                        || h.includes('dsetqu')
+                        || h.includes('tgrew')
+                        || /form=ml2x[0-9a-z]/i.test(h)
+                        || (h.includes('bing.com/search') && (t.includes('+10') || t.includes('10 points')))
+                    ) && x.visible;
+                });
+            }"""
+        )
+    except Exception as e:
+        log(f"  dashboard daily scan failed: {type(e).__name__}: {str(e)[:120]}")
+        return []
+
+    cards: list[Card] = []
+    for item in items:
+        href = absolute_url(item.get("href", ""), page.url)
+        text = clean_text(item.get("text", ""))
+        if not href or not text:
+            continue
+        query = parse_qs(urlparse(href).query)
+        if query.get("rnoreward", [""])[0] == "1":
+            continue
+        low = text.lower()
+        if any(m.lower() in low for m in COMPLETED_MARKERS):
+            continue
+        pts = extract_points(text) or 10
+        if pts <= 0:
+            continue
+        cards.append(Card(
+            title=title_from_text(text),
+            points=pts,
+            href=href,
+            aria=text,
+            kind=classify(text, href, text),
+            source_url=page.url,
+            selector=item.get("selector", ""),
+            text=text,
+        ))
+    seen = set()
+    uniq: list[Card] = []
+    for c in cards:
+        key = (c.href, c.title.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    return uniq
+
+
 async def discover_cards(page: Page) -> list[Card]:
     """Discover earnable activities on the current Rewards page.
 
@@ -648,6 +824,8 @@ async def discover_cards(page: Page) -> list[Card]:
     except Exception as e:
         log(f"  candidate collection failed: {type(e).__name__}: {str(e)[:120]}")
         candidates = []
+    if "/dashboard" in urlparse(page.url).path:
+        cards.extend(await discover_dashboard_daily_cards(page))
     for item in candidates:
         aria = clean_text(item.get("aria", ""))
         text = clean_text(item.get("text", ""))
@@ -674,6 +852,8 @@ async def discover_cards(page: Page) -> list[Card]:
         if any(p in low for p in SKIP_PATTERNS_ARIA) and kind not in {"streak_activity", "app_checkin"}:
             continue
         low_href = href.lower()
+        if parse_qs(urlparse(href).query).get("rnoreward", [""])[0] == "1":
+            continue
         if any(p in low_href for p in SKIP_PATTERNS_HREF) and "/earn/quest/" not in low_href:
             continue
         cards.append(Card(
@@ -901,7 +1081,8 @@ async def _click_card(dashboard: Page, card: Card, ctx: BrowserContext, *,
     try:
         if card.source_url and dashboard.url.split("#", 1)[0] != card.source_url.split("#", 1)[0]:
             await dashboard.goto(card.source_url, wait_until="domcontentloaded", timeout=30_000)
-            await dashboard.wait_for_timeout(1500)
+            await dashboard.wait_for_timeout(2500)
+        await expand_dashboard_daily_section(dashboard)
     except Exception:
         pass
     locators = []
@@ -1018,9 +1199,12 @@ async def do_explore_search(ctx: BrowserContext, dashboard: Page, card: Card) ->
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
         await jitter(1.8, 4.2)
         kw = keyword_for(card)
-        await tab.goto(bing_search_url(kw, card), wait_until="domcontentloaded", timeout=20_000)
+        if not await submit_bing_search(tab, kw, human=True):
+            log("     Bing search box not found after visible card click")
+            return False
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
         await jitter(*SEARCH_DWELL_RANGE)
+        await remember_bing_header_points(dashboard, tab)
         return True
     except Exception as e:
         log(f"     failed: {e}")
@@ -1124,7 +1308,7 @@ async def do_skip_known(ctx: BrowserContext, dashboard: Page, card: Card) -> Opt
 
 
 async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
-    """3-to-10-question multiple choice. Pick the option whose URL has WQSCORE:1.
+    """3-to-10-question multiple choice.
 
     Hardened: stops on stale tabs / detached locators / context death so a single
     bad quiz can't take the whole run down with it. Returns True if at least one
@@ -1150,6 +1334,7 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
     try:
         await tab.wait_for_load_state("domcontentloaded", timeout=30_000)
         await jitter(3.0, 5.5)
+        await remember_bing_header_points(dashboard, tab)
         # Dismiss any consent banner.
         for _ in range(2):
             try:
@@ -1161,22 +1346,100 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
             if tab.is_closed():
                 log(f"     tab closed before q{qi + 1}; stopping.")
                 break
-            # Find the correct-answer link.
             target = None
+            target_label = ""
             try:
-                for selector in [
-                    'a[href*="WQSCORE%3A%221%22"]',
-                    'a[href*="WQCI"]',  # any option as fallback
-                ]:
-                    loc = tab.locator(selector)
-                    if await loc.count() > 0:
-                        target = loc.first
-                        break
+                option = await tab.evaluate(
+                    """() => {
+                        const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                        const visible = (el) => {
+                            const r = el.getBoundingClientRect();
+                            const st = getComputedStyle(el);
+                            return r.width > 4 && r.height > 4 && r.bottom > 0 && r.top < innerHeight
+                                && st.display !== 'none' && st.visibility !== 'hidden';
+                        };
+                        const cssEscape = (value) => {
+                            if (window.CSS && CSS.escape) return CSS.escape(value);
+                            return String(value).replace(/["\\\\]/g, '\\\\$&');
+                        };
+                        const cards = [...document.querySelectorAll('.btq_card.btq_quesP, .btq_opts')]
+                            .filter(visible)
+                            .filter((el) => !String(el.className || '').includes('btq_hideCompulsary'));
+                        const root = cards[0] || document;
+                        const links = [...root.querySelectorAll('.btq_opt a[href*="WQCI"], .btq_opt a[href*="WQSCORE"]')]
+                            .filter(visible)
+                            .map((a, index) => {
+                                const href = a.getAttribute('href') || '';
+                                const decoded = (() => {
+                                    try { return decodeURIComponent(href); } catch { return href; }
+                                })();
+                                const score = /WQSCORE[:=]"?(\\d+)/i.exec(decoded)?.[1]
+                                    || /WQSCORE%3A%22(\\d+)%22/i.exec(href)?.[1]
+                                    || /WQSCORE(?:%3a|=)(?:%22)?(\\d+)/i.exec(href)?.[1]
+                                    || '0';
+                                return {
+                                    index,
+                                    href,
+                                    text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || ''),
+                                    score: Number.parseInt(score, 10) || 0,
+                                };
+                            });
+                        if (!links.length) return null;
+                        links.sort((a, b) => b.score - a.score || a.index - b.index);
+                        return links[0];
+                    }"""
+                )
+                if option:
+                    href = absolute_url(option.get("href", ""), tab.url)
+                    target_label = clean_text(option.get("text", ""))
+                    if href:
+                        target = tab.locator(f'a[href="{css_attr(href)}"]').first
+                        if await target.count() == 0:
+                            target = tab.locator(f'a[href="{css_attr(urlparse(href).path + "?" + urlparse(href).query)}"]').first
+                    if target is None or await target.count() == 0:
+                        target = tab.locator('a[href*="WQCI"], a[href*="WQSCORE"]').filter(has_text=target_label).first
             except Exception as e:
                 log(f"     locator query died at q{qi + 1}: {type(e).__name__}; stopping.")
                 break
             if target is None:
+                next_button = None
+                try:
+                    if await tab.locator(".btq_card.btq_ansP .btq_nxtQues button").count() > 0:
+                        next_button = tab.locator(".btq_card.btq_ansP .btq_nxtQues button").first
+                    else:
+                        for label in ("下一个", "Next", "次へ"):
+                            loc = tab.get_by_text(label).locator(
+                                "xpath=ancestor-or-self::*[self::button or @role='button'][1]"
+                            ).first
+                            if await loc.count() > 0:
+                                next_button = loc
+                                break
+                except Exception:
+                    next_button = None
+                if next_button is not None:
+                    try:
+                        await next_button.scroll_into_view_if_needed(timeout=4000)
+                    except Exception:
+                        pass
+                    try:
+                        await next_button.click(timeout=8000)
+                        await jitter(1.8, 3.4)
+                        consecutive_misses = 0
+                        continue
+                    except Exception:
+                        pass
                 consecutive_misses += 1
+                try:
+                    result_link = tab.locator(".btq_card.btq_ansP a[href*='WQId'], .btq_card.btq_ansP a[href*='WQOskey']").filter(
+                        has_text=re.compile("查看结果|View results|結果", re.I)
+                    ).first
+                    if await result_link.count() > 0:
+                        await result_link.click(timeout=8000)
+                        await jitter(2.5, 4.0)
+                        await remember_bing_header_points(dashboard, tab)
+                        break
+                except Exception:
+                    pass
                 if consecutive_misses >= 2:
                     log(f"     no options at q{qi + 1} (twice); quiz complete or unreachable.")
                     break
@@ -1206,6 +1469,8 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
             if not clicked:
                 continue
             answered += 1
+            if target_label:
+                log(f"     answered q{answered}: {target_label[:40]}")
             # Wait for navigation (clicking answer triggers a page change).
             try:
                 await tab.wait_for_load_state("domcontentloaded", timeout=12_000)
@@ -1216,6 +1481,7 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
                 log(f"     wait_for_load died at q{qi + 1}; stopping.")
                 break
             await jitter(2.5, 4.0)
+            await remember_bing_header_points(dashboard, tab)
         return answered > 0
     except Exception as e:
         log(f"     quiz outer error ({answered} answered): {type(e).__name__}: {e}")
@@ -1468,6 +1734,14 @@ async def run_search_quota(p, label: str, ua: str, cap: int, extra: int = 0) -> 
 async def read_points(page: Page) -> tuple[Optional[int], Optional[int]]:
     """Read (available, today) from old counters or the new dashboard/earn copy."""
     try:
+        cached_bing = getattr(page, "_last_bing_available", None)
+        live_bing = await read_bing_header_points(page)
+        if live_bing is not None:
+            cached_bing = max(cached_bing or 0, live_bing)
+            try:
+                setattr(page, "_last_bing_available", cached_bing)
+            except Exception:
+                pass
         await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=20_000)
         await page.wait_for_timeout(2500)
         available = today = None
@@ -1499,6 +1773,12 @@ async def read_points(page: Page) -> tuple[Optional[int], Optional[int]]:
             available = parse_labeled_number(earn_body, ["Available points", "可用积分"]) or available
         except Exception:
             pass
+        if cached_bing is not None:
+            available = max(available or 0, cached_bing)
+            try:
+                setattr(page, "_last_bing_available", available)
+            except Exception:
+                pass
         return available, today
     except Exception:
         return None, None
