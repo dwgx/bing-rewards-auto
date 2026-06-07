@@ -10,7 +10,7 @@
 
 | 类型 | 识别方式 | 处理方式 |
 |---|---|---|
-| **Explore on Bing** 分类卡 | `rwAutoFlyout=exb` | 点可见卡片 → 在打开的 Bing 页真实输入主题关键词 → 验证到账 |
+| **Explore on Bing** 分类卡 | `rwAutoFlyout=exb` | 点可见卡片 → 在打开的 Bing 页真实输入主题关键词 → 验证积分、浏览进度或卡片状态变化 |
 | **每日任务 · 搜索** | URL 含 `form=ML2X*` / `tgrew*` / `ML1*` | 点可见卡片后等待到账 |
 | **每日任务 · Quiz** (3 题选择) | URL 含 `form=dsetqu` / `ML2BF1` | 逐题点正确答案（URL 里 `WQSCORE:1` 的） |
 | **图片拼图 Puzzle it** | `spotlight/imagepuzzle` | 点 "Skip puzzle" 即得分 |
@@ -83,7 +83,7 @@
 
 控制台会实时显示进度，同时写入 `logs/run_YYYYMMDD_HHMMSS.log`（每次一份带时间戳）+ `last_run.log`（最近一次的副本）。跑完按任意键关窗，60 秒不操作自动关。
 
-如果某个真实点击后的任务没有带来积分增长或任务状态变化，日志会显示 `Safety stop`，本次运行会跳过后续任务、搜索和二次扫描，避免重复尝试同一个失败动作。
+如果某个真实点击后的任务没有带来积分增长、浏览进度增长或任务状态变化，日志会显示 `Safety stop`，本次运行会跳过后续任务、搜索和二次扫描，避免重复尝试同一个失败动作。失败卡片会写入本地 `.rewards_failures.json`，当天后续运行会跳过同一张卡。
 
 新版 dashboard 的“每日活动”折叠区会先展开，再只处理真实可见的链接；带 `rnoreward=1` 的展示/已完成链接不会作为可到账任务执行。Bing quiz 会按可见题卡选择正确答案、点击“下一个/查看结果”，并以积分或任务状态变化为准。
 
@@ -130,6 +130,7 @@ schtasks /delete /tn "BingRewardsEdge" /f
 | `auth_msedge.json` / `auth_chrome.json` / `auth_chromium.json` | 登录 state（脚本生成，**禁止外传**） |
 | `logs/run_*.log` | 每次运行的完整日志 |
 | `last_run.log` | 最近一次的日志副本 |
+| `.rewards_failures.json` | 当天失败卡片缓存（脚本生成，避免重复点同一失败项） |
 | `.gitignore` | 防 auth/log 被提交 |
 
 ## 调试 & 扩展

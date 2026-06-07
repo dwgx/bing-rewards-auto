@@ -10,6 +10,8 @@ cookies, auth JSON, or account identifiers here.
 - After each action, verify points or card-state change.
 - Stop on uncredited or unexpected state.
 - Do not repeat the same uncredited action in the same run.
+- Persist same-day failed card IDs in `.rewards_failures.json` so a later run
+  does not repeat an action that already failed to credit or advance progress.
 
 ## Explore on Bing
 
@@ -47,10 +49,18 @@ Recent trace results:
   but available/today points stayed `8510/27`.
 - `02:00:54`, visible Explore card was tried after the dashboard quiz completed;
   no points/card-state change was detected, so the run safety-stopped.
+- `04:08:36`, `/earn` "在必应上浏览" progress was readable as `0/18`.
+  The "保护重要的事物" card advanced the browse progress to `10/18` and then
+  showed as completed.
+- In the same session, "计划一次快速的短途旅行", "规划你的未来", and
+  "在 Bing 上找到优惠" did not advance browse progress. Some still produced
+  ordinary Bing search points (`+3`), which must not be treated as Explore-card
+  success.
 
 Interpretation: the protocol was followed, but the account did not receive more
-points for these repeated Explore cards during this session. The safe behavior is
-to stop instead of retrying.
+points or browse progress for some repeated/activated Explore cards during this
+session. The safe behavior is to require browse progress, card removal, or a
+visible completed state before continuing.
 
 ## Dashboard daily activities
 

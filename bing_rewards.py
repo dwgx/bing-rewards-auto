@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -42,6 +43,7 @@ from playwright.async_api import (
 
 HERE = Path(__file__).resolve().parent
 LOG_FILE = HERE / "last_run.log"
+FAILURE_FILE = HERE / ".rewards_failures.json"
 
 # Browser channel + auth-file are picked by cli() based on --browser. Defaults
 # preserve backwards compatibility with the original single-browser layout.
@@ -402,6 +404,17 @@ def extract_progress(text: str) -> Optional[tuple[int, int]]:
     if not valid:
         return None
     return max(valid, key=lambda pair: pair[1])
+
+
+def progress_increased(before: Optional[tuple[int, int]],
+                       after: Optional[tuple[int, int]]) -> tuple[bool, str]:
+    if not before or not after:
+        return False, "progress unavailable"
+    before_done, before_total = before
+    after_done, after_total = after
+    if after_total == before_total and after_done > before_done:
+        return True, f"browse progress +{after_done - before_done} ({before_done}/{before_total} -> {after_done}/{after_total})"
+    return False, "no browse progress increase"
 
 
 def parse_int(text: str) -> Optional[int]:
@@ -839,10 +852,10 @@ async def discover_cards(page: Page) -> list[Card]:
             continue
         if any(m.lower() in low for m in COMPLETED_MARKERS):
             continue
-        pts = extract_points(combined)
-        if pts <= 0:
-            continue
         kind = classify(aria, href, text)
+        pts = extract_points(combined)
+        if pts <= 0 and kind != "explore_search":
+            continue
         title = title_from_text(aria or text)
         if not href and (len(title) < 4 or re.fullmatch(r"(?:\+?\d+\s*){1,3}(?:points?|积分|分|点)?", title, re.I)):
             continue
@@ -899,6 +912,58 @@ def card_key(card: Card) -> tuple[str, str, int]:
     return (card.title.lower(), card.href or card.selector, card.points)
 
 
+def card_failure_id(card: Card) -> str:
+    raw = "|".join([
+        card.kind,
+        clean_text(card.title).lower(),
+        card.href or card.selector,
+    ])
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def failure_today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def load_failures() -> dict:
+    try:
+        data = json.loads(FAILURE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_failures(data: dict) -> None:
+    try:
+        FAILURE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def card_failed_today(card: Card) -> bool:
+    return load_failures().get(card_failure_id(card), {}).get("date") == failure_today()
+
+
+def remember_failed_card(card: Card, reason: str) -> None:
+    data = load_failures()
+    data[card_failure_id(card)] = {
+        "date": failure_today(),
+        "kind": card.kind,
+        "title": clean_text(card.title)[:120],
+        "reason": clean_text(reason)[:160],
+    }
+    save_failures(data)
+
+
+def conservative_skip_reason(card: Card) -> str:
+    text = clean_text(f"{card.aria} {card.text} {card.title}").lower()
+    if card.kind == "explore_search" and card.points <= 0 and re.search(r"已激活|activated", text, re.I):
+        return "zero-point Explore card is already activated"
+    return ""
+
+
 def card_text_snippets(card: Card) -> list[str]:
     raw = clean_text(card.text or card.aria or card.title)
     raw = re.sub(r"\+\d+\s*(?:points?|分|点)?[\s\S]*$", "", raw, flags=re.I)
@@ -920,6 +985,23 @@ def card_text_snippets(card: Card) -> list[str]:
 
 async def wait_for_credit(page: Page, card: Card,
                           before: tuple[Optional[int], Optional[int]]) -> tuple[bool, str, tuple[Optional[int], Optional[int]]]:
+    task_reason = getattr(page, "_last_task_success_reason", None)
+    if task_reason:
+        try:
+            delattr(page, "_last_task_success_reason")
+        except Exception:
+            pass
+        return True, str(task_reason), await read_points(page)
+
+    require_browse_progress = card.kind == "explore_search" and bool(
+        getattr(page, "_last_explore_progress_required", False)
+    )
+    if hasattr(page, "_last_explore_progress_required"):
+        try:
+            delattr(page, "_last_explore_progress_required")
+        except Exception:
+            pass
+
     start = time.monotonic()
     after = before
     last_reason = "no points/card-state change detected"
@@ -928,8 +1010,10 @@ async def wait_for_credit(page: Page, card: Card,
         after = await read_points(page)
         credited, reason = points_delta(before, after)
         if credited:
-            suffix = "" if attempt == 0 else f" after {int(time.monotonic() - start)}s"
-            return True, reason + suffix, after
+            if not require_browse_progress:
+                suffix = "" if attempt == 0 else f" after {int(time.monotonic() - start)}s"
+                return True, reason + suffix, after
+            last_reason = f"{reason}, but browse progress did not advance"
         try:
             cards = await discover_rewards_cards(page)
             if card_key(card) not in {card_key(c) for c in cards}:
@@ -971,7 +1055,7 @@ SEARCH_KEYWORDS = [
     (re.compile(r"房屋|可售房产|real estate|house", re.I), "梦想小镇可售房产"),
     (re.compile(r"球队|比赛|sports", re.I), "最近球队比赛结果"),
     (re.compile(r"航班|假期|flight", re.I), "完美假期航班"),
-    (re.compile(r"coupon|discount|save more", re.I), "best coupon codes and discounts"),
+    (re.compile(r"优惠|折扣|购物清单|coupon|discount|save more", re.I), "购物清单商品优惠和折扣"),
     (re.compile(r"car|hit the road|vehicle", re.I), "new cars for sale near me"),
     (re.compile(r"home|upgrade your space|remodel", re.I), "home improvement tools kitchen"),
     (re.compile(r"stream|netflix|hulu|favorites", re.I), "best streaming services"),
@@ -1179,6 +1263,9 @@ async def _click_card(dashboard: Page, card: Card, ctx: BrowserContext, *,
 
 async def do_explore_search(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
     log(f"  -> explore_search: {card.title} ({card.points}p)")
+    before_progress = await read_browse_progress(dashboard)
+    if before_progress:
+        log(f"     browse progress before: {before_progress[0]}/{before_progress[1]}")
     tab = await _click_card(dashboard, card, ctx)
     if tab is None:
         return False
@@ -1200,6 +1287,20 @@ async def do_explore_search(ctx: BrowserContext, dashboard: Page, card: Card) ->
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
         await jitter(*SEARCH_DWELL_RANGE)
         await remember_bing_header_points(dashboard, tab)
+        after_progress = await read_browse_progress(dashboard)
+        if after_progress:
+            log(f"     browse progress after: {after_progress[0]}/{after_progress[1]}")
+        advanced, reason = progress_increased(before_progress, after_progress)
+        if advanced:
+            try:
+                setattr(dashboard, "_last_task_success_reason", reason)
+            except Exception:
+                pass
+        elif before_progress:
+            try:
+                setattr(dashboard, "_last_explore_progress_required", True)
+            except Exception:
+                pass
         return True
     except Exception as e:
         log(f"     failed: {e}")
@@ -1726,6 +1827,27 @@ async def run_search_quota(p, label: str, ua: str, cap: int, extra: int = 0) -> 
 
 # ---- points read helpers -------------------------------------------------
 
+async def read_browse_progress(page: Page) -> Optional[tuple[int, int]]:
+    """Read the /earn "Browse on Bing" progress such as 0/18."""
+    try:
+        await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(2200)
+        body = await page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        return None
+    lines = [clean_text(line) for line in (body or "").splitlines()]
+    lines = [line for line in lines if line]
+    labels = ("在必应上浏览", "Browse on Bing", "Explore on Bing")
+    for i, line in enumerate(lines):
+        if not any(label.lower() in line.lower() for label in labels):
+            continue
+        block = " ".join(lines[i:i + 6])
+        progress = extract_progress(block)
+        if progress:
+            return progress
+    return None
+
+
 async def read_points(page: Page) -> tuple[Optional[int], Optional[int]]:
     """Read (available, today) from old counters or the new dashboard/earn copy."""
     try:
@@ -1872,6 +1994,15 @@ async def main_run(headless: bool, *, run_search_bonus: bool = False,
         for c in cards:
             if stop_reason:
                 break
+            skip_reason = conservative_skip_reason(c)
+            if skip_reason:
+                log(f"  -> skip conservative {c.kind}: {c.title} ({skip_reason})")
+                skipped += 1
+                continue
+            if card_failed_today(c):
+                log(f"  -> skip failed-today {c.kind}: {c.title} ({c.points}p)")
+                skipped += 1
+                continue
             handler = HANDLERS.get(c.kind)
             if handler is None:
                 log(f"  !! no handler for kind={c.kind}: {c.title} — skipping")
@@ -1889,6 +2020,7 @@ async def main_run(headless: bool, *, run_search_bonus: bool = False,
                         ok += 1
                     else:
                         log(f"     uncredited: {reason}")
+                        remember_failed_card(c, reason)
                         failed += 1
                         stop_reason = f"stopped after uncredited task: {c.title[:80]}"
             except Exception as e:
@@ -1953,6 +2085,15 @@ async def main_run(headless: bool, *, run_search_bonus: bool = False,
                 if stop_reason:
                     break
                 log(f"    [{c.kind:<14}] {urlparse(c.source_url).path:<11} {c.title[:50]:<52} +{c.points}p")
+                skip_reason = conservative_skip_reason(c)
+                if skip_reason:
+                    log(f"       skip conservative: {skip_reason}")
+                    skipped += 1
+                    continue
+                if card_failed_today(c):
+                    log(f"       skip failed-today: {c.title}")
+                    skipped += 1
+                    continue
                 handler = HANDLERS.get(c.kind)
                 if not handler:
                     skipped += 1
@@ -1969,6 +2110,7 @@ async def main_run(headless: bool, *, run_search_bonus: bool = False,
                         ok += 1
                     elif done is not None:
                         log(f"       uncredited: {reason}")
+                        remember_failed_card(c, reason)
                         failed += 1
                         stop_reason = f"stopped after uncredited second-sweep task: {c.title[:80]}"
                 except Exception as e:
@@ -2023,6 +2165,9 @@ async def dump_rewards(headless: bool) -> None:
                 log(f"  load failed: {type(e).__name__}: {str(e)[:160]}")
                 continue
             log(f"  final url: {page.url}")
+            browse_progress = await read_browse_progress(page) if url == EARN_URL else None
+            if browse_progress:
+                log(f"  browse progress: {browse_progress[0]}/{browse_progress[1]}")
             cards = await discover_cards(page)
             log(f"  normalized cards: {len(cards)}")
             for c in cards[:80]:
@@ -2037,7 +2182,8 @@ async def dump_rewards(headless: bool) -> None:
             for item in candidates:
                 text = clean_text(f"{item.get('aria', '')} {item.get('text', '')}")
                 href = absolute_url(item.get("href", ""), page.url)
-                if extract_points(text) > 0 or "earn" in text.lower() or "point" in text.lower():
+                if (extract_points(text) > 0 or "earn" in text.lower() or "point" in text.lower()
+                        or "rwautoflyout=exb" in href.lower()):
                     interesting.append((text, href, item.get("selector", "")))
             log(f"  raw interesting clickables: {len(interesting)}")
             for text, href, selector in interesting[:120]:

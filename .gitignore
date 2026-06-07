@@ -12,6 +12,7 @@ last_run.log
 last_run_chrome.log
 last_run_chromium.log
 logs/
+.rewards_failures.json
 
 # Debug screenshots from interactive testing
 diag*.png
