@@ -69,8 +69,10 @@ Observed on 2026-06-08.
 - The dashboard "每日活动" section is a collapsed disclosure. Its child links exist
   in the DOM while the panel height is `0`, so automation must first expand the
   visible disclosure button and only then act on visible links.
-- Some visible dashboard daily search links contain `rnoreward=1`; these can be
-  already-completed/display-only links and are filtered out as non-earnable.
+- Some visible dashboard daily search links contain `rnoreward=1`. Do not
+  blanket-filter them: a visible `rnoreward=1` daily link credited during local
+  testing. Use visibility, locked/completed text, and post-action verification
+  instead.
 - The remaining `form=dsetqu` Bing quiz used standard `.btq_opt` answer links.
   Correct choices were identified from the highest cumulative `WQSCORE` on the
   currently visible question card, then the visible "下一个" button advanced the
