@@ -1,6 +1,8 @@
 # Bing Rewards 自动签到
 
-每天自动扫 `rewards.bing.com` 上所有还能领的积分任务。**支持 Edge、Chrome 和 Playwright Chromium**，可独立各一份登录态、独立运行。
+每天自动扫 `rewards.bing.com` 上仍然可见、仍然能领取的积分任务。**支持 Edge、Chrome 和 Playwright Chromium**，可独立各一份登录态、独立运行。
+
+脚本现在默认走保守模式：只点 Rewards 页面真实展示的任务；一次只做一个动作；动作后读取积分/任务状态；没有到账或状态没变就停止后续任务，不会重复硬刷。
 
 ## 自动识别的任务
 
@@ -8,15 +10,16 @@
 
 | 类型 | 识别方式 | 处理方式 |
 |---|---|---|
-| **Explore on Bing** 分类卡 | `rwAutoFlyout=exb` | 点卡片 → 新 tab 搜主题关键词 |
-| **每日任务 · 搜索** | URL 含 `form=ML2X*` / `tgrew*` / `ML1*` | 开链接即得分 |
+| **Explore on Bing** 分类卡 | `rwAutoFlyout=exb` | 点可见卡片 → 新 tab 搜主题关键词 → 验证到账 |
+| **每日任务 · 搜索** | URL 含 `form=ML2X*` / `tgrew*` / `ML1*` | 点可见卡片后等待到账 |
 | **每日任务 · Quiz** (3 题选择) | URL 含 `form=dsetqu` / `ML2BF1` | 逐题点正确答案（URL 里 `WQSCORE:1` 的） |
 | **图片拼图 Puzzle it** | `spotlight/imagepuzzle` | 点 "Skip puzzle" 即得分 |
 | **Bing Image Creator 每日** | `images/create` | 自动写 prompt 生成一张图 |
-| **其他 More Activities** 链接 | 兜底 `bing.com` | 打开等 4 秒 |
-| **PC 搜索** (0→90p) | pointsbreakdown 扫余量 | ~35 次随机词 + 25 次额外凑 100-bonus |
-| **Mobile 搜索** (0→60p) | 手机 UA + 小视口 | ~25 次随机词 + 15 次额外凑 100-bonus |
-| **"Earn 100 extra points/day"** | 累积器 | 由 PC/Mobile 额外搜索带动 |
+| **其他 More Activities** 链接 | 兜底 `bing.com` | 点可见卡片后等待到账 |
+| **PC 搜索** (0→90p) | pointsbreakdown 扫余量 | 默认不跑；显式 `--search-quota` 时小批量输入搜索并逐次验账 |
+| **Mobile 搜索** (0→60p) | 手机 UA + 小视口 | 默认不跑；显式 `--search-quota` 时小批量输入搜索并逐次验账 |
+| **"Earn 100 extra points/day"** | `/earn` 累积器 | 默认只激活卡片；额外搜索需显式 `--search-bonus`，且逐次验账 |
+| **每日连签 / 必应应用连签** | `/earn` 无链接按钮 | 目前只识别并跳过；先用 trace 研究协议，不盲点 |
 
 ## 自动跳过（带原因）
 
@@ -80,6 +83,8 @@
 
 控制台会实时显示进度，同时写入 `logs/run_YYYYMMDD_HHMMSS.log`（每次一份带时间戳）+ `last_run.log`（最近一次的副本）。跑完按任意键关窗，60 秒不操作自动关。
 
+如果某个真实点击后的任务没有带来积分增长或任务状态变化，日志会显示 `Safety stop`，本次运行会跳过后续任务、搜索和二次扫描，避免重复尝试同一个失败动作。
+
 如果脚本崩了，窗口不会闪退，错误堆栈会留在窗口里 + 日志里。
 
 典型输出：
@@ -131,6 +136,12 @@ schtasks /delete /tn "BingRewardsEdge" /f
 python bing_rewards.py --show                      # 不无头跑，看浏览器实际操作
 python bing_rewards.py --browser chrome --show     # Chrome 版可视化
 python bing_rewards.py --browser chromium --show   # Chromium 兜底版可视化
+python bing_rewards.py --dump-rewards              # 打印 dashboard/earn 任务诊断
+python bing_rewards.py --trace-card streak_activity --show  # 单点跟踪每日连签按钮
+python bing_rewards.py --trace-card app_checkin --show      # 单点跟踪必应应用连签按钮
+python bing_rewards.py --search-quota              # 显式运行 PC/Mobile 搜索额度的小批量搜索
+python bing_rewards.py --search-bonus              # 显式运行 100 分搜索 bonus 的小批量额外搜索
+python bing_rewards.py --copilot                   # 显式提交一次 Copilot prompt
 python bing_rewards.py --import-profile            # 从当前 Edge profile 导入 auth_msedge.json
 python bing_rewards.py --import-profile --browser chrome
 python bing_rewards.py --import-cdp http://127.0.0.1:9222
@@ -142,5 +153,7 @@ python bing_rewards.py --auth-file path/to/x.json  # 自定义 auth 路径
 ## 安全注意
 
 - `auth_*.json` 是你 MS 账户登录态，能完整代表你的账号。**别分享、别上云盘**
-- 脚本不会下单 / 不会兑换 / 不会发消息 / 不改账户设置 — 只做"搜索 / 浏览 / 生成图片"这些等同于浏览 Bing 的动作
+- 我不能保证任何第三方账号自动化“绝对不会被封”。本项目也不会加入代理轮换、指纹伪装、验证码绕过、批量硬刷等规避风控功能
+- 脚本不会下单 / 不会兑换 / 不会发消息 / 不改账户设置；只做可见任务点击、搜索、浏览、生成图片这类与手动使用 Bing 相同的动作
+- 默认策略是慢速、随机停顿、单步验账、失败即停；这能降低误操作和重复刷的风险，但不等于账号风险为零
 - Cookie 一般可用数月。被踢出（登录页又出现）就重跑对应的 `setup-*.bat`

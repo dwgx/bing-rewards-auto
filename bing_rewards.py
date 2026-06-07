@@ -1,16 +1,16 @@
-"""Bing Rewards auto farmer — Edge edition.
+"""Bing Rewards conservative automation — Edge edition.
 
 First run: `python bing_rewards.py --login`   # opens Edge, you sign in once, auth.json saved
-Daily:     `python bing_rewards.py`           # headless, runs every still-earnable task
+Daily:     `python bing_rewards.py`           # headless, runs visible still-earnable tasks
 
 Handled task families (auto-discovered from the dashboard each run):
-  - "Explore on Bing" category cards   : dashboard-click -> search topical keyword
-  - Daily set / More activities links  : open or play (quiz, puzzle, this-or-that, search)
+  - "Explore on Bing" category cards   : visible card click -> search topical keyword -> verify
+  - Daily set / More activities links  : visible card click -> play/open -> verify
   - Bing Image Creator daily           : generate one image
   - Multi-question quizzes             : click the correct option (url has WQSCORE:1) per question
   - Image "Puzzle it"                  : click Skip (credits on skip)
-  - PC search quota 90/90              : ~35 desktop searches with jitter
-  - Mobile search quota 60/60          : ~25 mobile-UA searches with jitter
+  - PC/Mobile search quota             : small typed batches only when quota is readable
+  - Extra search bonus                 : opt-in with --search-bonus, one search then verify
 
 Auto-skips (with a logged reason) — flip them back on only if MS enables them for your market:
   - Cards marked "Offer is Locked" / "Available tomorrow" / "Earn -1 points"
@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urljoin, urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -48,8 +48,20 @@ LOG_FILE = HERE / "last_run.log"
 BROWSER_CHANNEL = "msedge"
 AUTH_FILE = HERE / "auth.json"
 
-REWARDS_URL = "https://rewards.bing.com/"
+REWARDS_URL = "https://rewards.bing.com/dashboard"
+EARN_URL = "https://rewards.bing.com/earn"
 BREAKDOWN_URL = "https://rewards.bing.com/pointsbreakdown"
+REWARDS_PAGES = (REWARDS_URL, EARN_URL)
+
+# Conservative pacing. This is not an anti-detection or bypass layer; it simply
+# keeps the automation close to normal manual use: one visible action, then wait,
+# verify, and stop on unexpected state.
+TASK_PAUSE_RANGE = (6.0, 14.0)
+CREDIT_WAIT_RANGE = (4.5, 9.0)
+MAX_CREDIT_WAIT_SECONDS = 70
+MAX_CREDIT_POLLS = 5
+SEARCH_DWELL_RANGE = (5.0, 11.0)
+MAX_SEARCHES_PER_RUN = 8
 
 # Recent Edge UA strings. Real Edge channel already sends an Edge UA; we set these only for
 # the mobile search sub-context and as belt-and-suspenders on the desktop context.
@@ -316,6 +328,11 @@ async def first_time_login() -> None:
 LOCKED_MARKERS = (
     "Available tomorrow", "Offer is Locked", "Earn -1 points", "offer is locked",
 )
+LOCKED_MARKERS += ("已锁定", "明天可用", "明天解锁", "ロック", "明日")
+
+COMPLETED_MARKERS = (
+    "points earned", "completed", "complete", "已完成", "已赚取", "完了", "獲得済み",
+)
 
 SKIP_PATTERNS_ARIA = (
     "referral", "refer and earn", "紹介", "sweepstake", "entries",
@@ -324,12 +341,18 @@ SKIP_PATTERNS_ARIA = (
     "redemption goal", "order history", "claim your gift", "shop to earn",
     "set goal", "目標", "ロボット",
 )
+SKIP_PATTERNS_ARIA += (
+    "推荐", "邀请", "抽奖", "奖品", "兑换", "礼品卡", "订单历史", "目标",
+    "优惠券", "ギフト", "懸賞", "寄付",
+    "签到", "移动应用", "必应应用", "app streak",
+)
 
 SKIP_PATTERNS_HREF = (
     "sweepstakes/", "referandearn", "aka.ms/win", "workinprogress",
     "punchcard", "microsoft-store", "goal/all", "orderhistory",
     "/redeem", "/redeemgoal", "xbox.com/rewards",
 )
+SKIP_PATTERNS_HREF += ("/refer", "rewards.bing.com/redeem")
 
 
 @dataclass
@@ -339,10 +362,146 @@ class Card:
     href: str
     aria: str
     kind: str  # explore_search | quiz | daily_search | image_creator | image_puzzle | open_only | unknown
+    source_url: str = REWARDS_URL
+    selector: str = ""
+    text: str = ""
 
 
-def classify(aria: str, href: str) -> str:
-    low_a, low_h = aria.lower(), href.lower()
+def clean_text(text: str) -> str:
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text or "")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def absolute_url(href: str, base: str = REWARDS_URL) -> str:
+    if not href:
+        return ""
+    return urljoin(base, href)
+
+
+def extract_points(text: str) -> int:
+    text = clean_text(text)
+    patterns = [
+        r"Earn\s+(\d+)\s+points?",
+        r"\+(\d+)\s*(?:points?|分|点)?\b",
+        r"(\d+)\s*(?:points?|分|点)\s*(?:$|已完成|完了)",
+        r"(\d+)\s+points?\s*$",
+        r"(\d+)\s*[分点]\s*$",
+        r"\+(\d+)\s*p\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def extract_progress(text: str) -> Optional[tuple[int, int]]:
+    matches = re.findall(r"(\d+)\s*/\s*(\d+)", clean_text(text))
+    valid = [(int(a), int(b)) for a, b in matches if int(b) > 1]
+    if not valid:
+        return None
+    return max(valid, key=lambda pair: pair[1])
+
+
+def parse_int(text: str) -> Optional[int]:
+    if not text:
+        return None
+    m = re.search(r"\d[\d,]*", str(text))
+    return int(m.group(0).replace(",", "")) if m else None
+
+
+def parse_labeled_number(text: str, labels: list[str]) -> Optional[int]:
+    lines = [clean_text(line) for line in (text or "").splitlines()]
+    lines = [line for line in lines if line]
+    lower_labels = [label.lower() for label in labels]
+    for i, line in enumerate(lines):
+        low = line.lower()
+        for label in lower_labels:
+            idx = low.find(label)
+            if idx < 0:
+                continue
+            value = parse_int(line[idx + len(label):])
+            if value is not None:
+                return value
+            for next_line in lines[i + 1:i + 4]:
+                value = parse_int(next_line)
+                if value is not None:
+                    return value
+    return None
+
+
+def points_delta(before: tuple[Optional[int], Optional[int]],
+                 after: tuple[Optional[int], Optional[int]]) -> tuple[bool, str]:
+    before_avail, before_today = before
+    after_avail, after_today = after
+    if before_avail is not None and after_avail is not None and after_avail > before_avail:
+        return True, f"available +{after_avail - before_avail}"
+    if before_today is not None and after_today is not None and after_today > before_today:
+        return True, f"today +{after_today - before_today}"
+    return False, "no points increase detected"
+
+
+def title_from_text(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return ""
+    title = re.split(r"\s{2,}|,\s*Earn\s+\d+|Earn\s+\d+\s+points?|(\d+)\s+points?$", text, maxsplit=1, flags=re.I)[0]
+    title = clean_text(title)
+    return title[:90] or text[:90]
+
+
+def css_attr(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def keyword_from_reward_text(text: str) -> Optional[str]:
+    text = clean_text(text)
+    if not text:
+        return None
+    text = re.sub(r"\+\d+\s*(?:points?|分|点)?", " ", text, flags=re.I)
+    text = re.sub(r"\d+\s*/\s*\d+\s*(?:个任务|tasks?)?", " ", text, flags=re.I)
+    text = re.sub(r"(?:Earn|赚取|获得)\s*\d+\s*(?:points?|积分|分|点)", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:on|with)\s+Bing\b", " ", text, flags=re.I)
+    text = re.sub(r"(?:在|用)\s*Bing\s*(?:上)?\s*(?:搜索|查找|寻找|查看|比较|以)?", " ", text, flags=re.I)
+    text = re.sub(r"(?:在|用)\s*必应\s*(?:上)?\s*(?:搜索|查找|寻找|查看|比较|以)?", " ", text, flags=re.I)
+    text = re.sub(r"\b(search|find|look up|compare|browse|explore)\b", " ", text, flags=re.I)
+    text = clean_text(text)
+
+    cjk_chunks = re.findall(r"[\u3400-\u9fff\u3040-\u30ff][\u3400-\u9fff\u3040-\u30ffA-Za-z0-9\s]{1,40}", text)
+    cleaned_chunks = []
+    stop = re.compile(r"(闪耀光芒|明天解锁|已激活|到期日期|任务|积分|每日|活动|完成|查看您的新仪表板)")
+    for chunk in cjk_chunks:
+        chunk = clean_text(stop.sub(" ", chunk))
+        chunk = re.sub(r"[，。、“”：「」『』（）()]+", " ", chunk)
+        chunk = clean_text(chunk)
+        if 2 <= len(chunk) <= 30:
+            cleaned_chunks.append(chunk)
+    if cleaned_chunks:
+        return cleaned_chunks[-1]
+
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", text)
+    stop_words = {
+        "earn", "points", "point", "search", "bing", "microsoft", "reward", "rewards",
+        "complete", "activity", "activities", "more", "daily", "today", "this", "that",
+        "with", "using", "your", "find", "look", "explore", "browse",
+    }
+    terms = [w.lower() for w in words if w.lower() not in stop_words]
+    if terms:
+        return " ".join(terms[:6])
+    return None
+
+
+def classify(aria: str, href: str, text: str = "") -> str:
+    low_a, low_h = (aria + " " + text).lower(), href.lower()
+    if "每日连签活动" in low_a or "daily streak" in low_a or "daily check" in low_a:
+        return "streak_activity"
+    if "必应应用连签" in low_a or "bing app" in low_a or "app streak" in low_a:
+        return "app_checkin"
+    if "/earn/quest/" in low_h:
+        return "quest"
+    if "ml2xqd" in low_h or "每天赚取100" in low_a or "extra100" in low_a:
+        return "search_bonus"
     if "images/create" in low_h or "image creator" in low_a:
         return "image_creator"
     if "rwautoflyout=exb" in low_h or "explore on bing" in low_a:
@@ -359,7 +518,51 @@ def classify(aria: str, href: str) -> str:
     return "unknown"
 
 
-async def discover_cards(page: Page) -> list[Card]:
+async def _collect_card_candidates(page: Page) -> list[dict]:
+    return await page.evaluate(
+        """() => {
+            const clean = (s) => (s || '').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g, '').replace(/\\s+/g, ' ').trim();
+            const cssEscape = (value) => {
+                if (window.CSS && CSS.escape) return CSS.escape(value);
+                return String(value).replace(/["\\\\]/g, '\\\\$&');
+            };
+            const selectorFor = (el) => {
+                if (!el || !el.tagName) return '';
+                if (el.id) return `${el.tagName.toLowerCase()}#${cssEscape(el.id)}`;
+                const aria = el.getAttribute('aria-label');
+                if (aria) return `${el.tagName.toLowerCase()}[aria-label="${cssEscape(aria)}"]`;
+                const href = el.getAttribute('href');
+                if (href) return `${el.tagName.toLowerCase()}[href="${cssEscape(href)}"]`;
+                const role = el.getAttribute('role');
+                if (role) return `${el.tagName.toLowerCase()}[role="${cssEscape(role)}"]`;
+                return el.tagName.toLowerCase();
+            };
+            const elements = new Set([
+                ...document.querySelectorAll('a[href], a[aria-label], button, [role="button"], [role="link"]'),
+                ...document.querySelectorAll('[data-bi-id], [data-m], [data-testid], [aria-label*="point" i], [aria-label*="earn" i]')
+            ]);
+            const out = [];
+            for (const el of elements) {
+                const clickable = el.closest('a[href], button, [role="button"], [role="link"]') || el;
+                const href = clickable.getAttribute('href') || el.getAttribute('href') || '';
+                const aria = clickable.getAttribute('aria-label') || el.getAttribute('aria-label') || '';
+                const text = clean([aria, clickable.innerText, el.innerText, clickable.getAttribute('title'), el.getAttribute('title')].filter(Boolean).join(' '));
+                if (!href && !aria && !text) continue;
+                out.push({
+                    tag: clickable.tagName.toLowerCase(),
+                    role: clickable.getAttribute('role') || '',
+                    href,
+                    aria,
+                    text,
+                    selector: selectorFor(clickable)
+                });
+            }
+            return out;
+        }"""
+    )
+
+
+async def discover_cards_legacy(page: Page) -> list[Card]:
     cards: list[Card] = []
     # Trigger lazy-loaded sections (More activities only renders after a scroll).
     try:
@@ -425,9 +628,174 @@ async def discover_cards(page: Page) -> list[Card]:
     return uniq
 
 
+async def discover_cards(page: Page) -> list[Card]:
+    """Discover earnable activities on the current Rewards page.
+
+    New Rewards layouts do not always expose tasks as a[aria-label], so discovery
+    uses a broader clickable/data-attribute scan and normalizes candidates here.
+    """
+    cards: list[Card] = []
+    try:
+        for y in (400, 1200, 2400, 3600, 5200):
+            await page.evaluate(f"window.scrollTo(0, {y})")
+            await page.wait_for_timeout(400)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(700)
+    except Exception:
+        pass
+    try:
+        candidates = await _collect_card_candidates(page)
+    except Exception as e:
+        log(f"  candidate collection failed: {type(e).__name__}: {str(e)[:120]}")
+        candidates = []
+    for item in candidates:
+        aria = clean_text(item.get("aria", ""))
+        text = clean_text(item.get("text", ""))
+        href = absolute_url(item.get("href", ""), page.url)
+        combined = clean_text(f"{aria} {text}")
+        if not combined and not href:
+            continue
+        if not href and not item.get("selector"):
+            continue
+        if href.strip() in ("#", "") and not item.get("selector"):
+            continue
+        low = combined.lower()
+        if any(m.lower() in low for m in LOCKED_MARKERS):
+            continue
+        if any(m.lower() in low for m in COMPLETED_MARKERS):
+            continue
+        pts = extract_points(combined)
+        if pts <= 0:
+            continue
+        kind = classify(aria, href, text)
+        title = title_from_text(aria or text)
+        if not href and (len(title) < 4 or re.fullmatch(r"(?:\+?\d+\s*){1,3}(?:points?|积分|分|点)?", title, re.I)):
+            continue
+        if any(p in low for p in SKIP_PATTERNS_ARIA) and kind not in {"streak_activity", "app_checkin"}:
+            continue
+        low_href = href.lower()
+        if any(p in low_href for p in SKIP_PATTERNS_HREF) and "/earn/quest/" not in low_href:
+            continue
+        cards.append(Card(
+            title=title,
+            points=pts,
+            href=href,
+            aria=aria,
+            kind=kind,
+            source_url=page.url,
+            selector=item.get("selector", ""),
+            text=text,
+        ))
+    seen = set()
+    uniq: list[Card] = []
+    for c in cards:
+        key = (c.title.lower(), c.href or c.selector, c.points)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    return uniq
+
+
+async def discover_rewards_cards(page: Page) -> list[Card]:
+    all_cards: list[Card] = []
+    for url in REWARDS_PAGES:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(3000)
+        except Exception as e:
+            log(f"  discovery page failed {url}: {type(e).__name__}: {str(e)[:120]}")
+            continue
+        cards = await discover_cards(page)
+        log(f"  discovery {urlparse(url).path or '/'}: {len(cards)} card(s)")
+        all_cards.extend(cards)
+    seen = set()
+    uniq: list[Card] = []
+    for c in all_cards:
+        key = (c.title.lower(), c.href or c.selector, c.points)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    return uniq
+
+
+def card_key(card: Card) -> tuple[str, str, int]:
+    return (card.title.lower(), card.href or card.selector, card.points)
+
+
+def card_text_snippets(card: Card) -> list[str]:
+    raw = clean_text(card.text or card.aria or card.title)
+    raw = re.sub(r"\+\d+\s*(?:points?|分|点)?[\s\S]*$", "", raw, flags=re.I)
+    raw = clean_text(raw)
+    snippets: list[str] = []
+    if raw:
+        snippets.append(raw[:70])
+        snippets.append(raw[:35])
+    title = clean_text(card.title)
+    if title and title not in snippets:
+        snippets.append(title[:50])
+    out: list[str] = []
+    for snippet in snippets:
+        snippet = clean_text(snippet)
+        if len(snippet) >= 6 and snippet not in out:
+            out.append(snippet)
+    return out
+
+
+async def wait_for_credit(page: Page, card: Card,
+                          before: tuple[Optional[int], Optional[int]]) -> tuple[bool, str, tuple[Optional[int], Optional[int]]]:
+    start = time.monotonic()
+    after = before
+    last_reason = "no points/card-state change detected"
+    for attempt in range(MAX_CREDIT_POLLS):
+        await jitter(*CREDIT_WAIT_RANGE)
+        after = await read_points(page)
+        credited, reason = points_delta(before, after)
+        if credited:
+            suffix = "" if attempt == 0 else f" after {int(time.monotonic() - start)}s"
+            return True, reason + suffix, after
+        try:
+            cards = await discover_rewards_cards(page)
+            if card_key(card) not in {card_key(c) for c in cards}:
+                suffix = "" if attempt == 0 else f" after {int(time.monotonic() - start)}s"
+                return True, "card removed from earn list" + suffix, after
+        except Exception as e:
+            last_reason = f"credit check discovery failed: {type(e).__name__}"
+        if time.monotonic() - start >= MAX_CREDIT_WAIT_SECONDS:
+            break
+    return False, last_reason, after
+
+
+async def wait_for_points_increase(page: Page,
+                                   before: tuple[Optional[int], Optional[int]]) -> tuple[bool, str, tuple[Optional[int], Optional[int]]]:
+    start = time.monotonic()
+    after = before
+    for attempt in range(MAX_CREDIT_POLLS):
+        await jitter(*CREDIT_WAIT_RANGE)
+        after = await read_points(page)
+        credited, reason = points_delta(before, after)
+        if credited:
+            suffix = "" if attempt == 0 else f" after {int(time.monotonic() - start)}s"
+            return True, reason + suffix, after
+        if time.monotonic() - start >= MAX_CREDIT_WAIT_SECONDS:
+            break
+    return False, "no points increase detected", after
+
+
 # ---- task handlers -------------------------------------------------------
 
 SEARCH_KEYWORDS = [
+    (re.compile(r"保险|insurance", re.I), "最适合我的保险计划"),
+    (re.compile(r"贷款|学生贷款|personal loans?", re.I), "个人贷款和学生贷款比较"),
+    (re.compile(r"手机套餐|通话|短信|mobile plan|phone plan", re.I), "适合我的手机套餐"),
+    (re.compile(r"邮轮|cruise", re.I), "邮轮优惠和目的地"),
+    (re.compile(r"互联网套餐|internet plan", re.I), "比较附近互联网套餐"),
+    (re.compile(r"珠宝|jewel", re.I), "适合任何场合的惊艳珠宝"),
+    (re.compile(r"住宿|酒店|hotel", re.I), "下一次冒险的住宿酒店"),
+    (re.compile(r"房屋|可售房产|real estate|house", re.I), "梦想小镇可售房产"),
+    (re.compile(r"球队|比赛|sports", re.I), "最近球队比赛结果"),
+    (re.compile(r"航班|假期|flight", re.I), "完美假期航班"),
     (re.compile(r"coupon|discount|save more", re.I), "best coupon codes and discounts"),
     (re.compile(r"car|hit the road|vehicle", re.I), "new cars for sale near me"),
     (re.compile(r"home|upgrade your space|remodel", re.I), "home improvement tools kitchen"),
@@ -447,28 +815,190 @@ SEARCH_KEYWORDS = [
 
 
 def keyword_for(card: Card) -> str:
-    text = card.aria + " " + card.title
+    try:
+        q = parse_qs(urlparse(card.href).query).get("q", [""])[0]
+        q = clean_text(unquote(q))
+        if q:
+            return q
+    except Exception:
+        pass
+    text = clean_text(f"{card.aria} {card.text} {card.title}")
     for pat, kw in SEARCH_KEYWORDS:
         if pat.search(text):
             return kw
+    inferred = keyword_from_reward_text(text)
+    if inferred:
+        return inferred
     return random.choice(SEARCH_POOL)
 
 
-async def _click_card(dashboard: Page, card: Card, ctx: BrowserContext) -> Optional[Page]:
-    """Click the dashboard card and return the popped-up tab (or a fresh tab on card.href fallback)."""
-    try:
-        async with ctx.expect_page(timeout=15_000) as new_page_info:
-            await dashboard.locator(f'a[aria-label^="{card.title.replace(chr(34), "")[:60]}"]').first.click()
-        return await new_page_info.value
-    except Exception:
-        # Fallback: just open the href
+def bing_search_url(query: str, card: Optional[Card] = None) -> str:
+    params: list[tuple[str, str]] = []
+    if card:
         try:
-            tab = await ctx.new_page()
-            await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
-            return tab
-        except Exception as e:
-            log(f"     fallback navigation failed: {e}")
+            params = [(k, v) for k, v in parse_qsl(urlparse(card.href).query, keep_blank_values=True)
+                      if k.lower() != "q"]
+        except Exception:
+            params = []
+    if not any(k.lower() == "form" for k, _ in params):
+        params.append(("form", "QBLH"))
+    if card and not any(k.lower() == "rwautoflyout" for k, _ in params):
+        params.append(("rwAutoFlyout", "exb"))
+    return "https://www.bing.com/search?" + urlencode([("q", query), *params])
+
+
+async def submit_bing_search(page: Page, query: str, *, human: bool = True) -> bool:
+    selectors = [
+        "textarea[name='q']",
+        "input[name='q']",
+        "#sb_form_q",
+        "textarea#searchbox",
+        "input[type='search']",
+        "textarea[placeholder*='Search']",
+        "input[placeholder*='Search']",
+        "textarea[placeholder*='搜索']",
+        "input[placeholder*='搜索']",
+        "textarea[aria-label*='Search']",
+        "input[aria-label*='Search']",
+        "textarea[aria-label*='搜索']",
+        "input[aria-label*='搜索']",
+    ]
+    locators = []
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() > 0:
+                locators.append(loc)
+        except Exception:
+            continue
+    for pattern in [r"search|搜索|搜尋|検索"]:
+        try:
+            loc = page.get_by_role("combobox", name=re.compile(pattern, re.I)).first
+            if await loc.count() > 0:
+                locators.append(loc)
+        except Exception:
+            continue
+    for loc in locators:
+        try:
+            await loc.click(timeout=5000)
+            await loc.fill("")
+            if human:
+                await loc.type(query, delay=random.randint(40, 110))
+            else:
+                await loc.fill(query)
+            await jitter(0.3, 0.9)
+            await loc.press("Enter")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _click_card(dashboard: Page, card: Card, ctx: BrowserContext, *,
+                      allow_fallback: bool = False,
+                      return_same_page_on_click: bool = False) -> Optional[Page]:
+    """Click the Rewards card and return the popped-up tab or same-page navigation page."""
+    try:
+        if card.source_url and dashboard.url.split("#", 1)[0] != card.source_url.split("#", 1)[0]:
+            await dashboard.goto(card.source_url, wait_until="domcontentloaded", timeout=30_000)
+            await dashboard.wait_for_timeout(1500)
+    except Exception:
+        pass
+    locators = []
+    for snippet in card_text_snippets(card):
+        locators.append(("text", snippet))
+    if card.selector:
+        locators.append(("css", card.selector))
+    if card.aria:
+        locators.append(("css", f'[aria-label="{css_attr(card.aria)}"]'))
+    if card.href:
+        href_path = urlparse(card.href).path
+        href_query = urlparse(card.href).query
+        if href_query:
+            locators.append(("css", f'a[href*="{css_attr(href_query[:80])}"]'))
+        if href_path and href_path != "/":
+            locators.append(("css", f'a[href*="{css_attr(href_path)}"]'))
+    try:
+        for locator_kind, locator_value in locators:
+            try:
+                if locator_kind == "text":
+                    text_loc = dashboard.get_by_text(re.compile(re.escape(locator_value), re.I)).first
+                    if await text_loc.count() == 0:
+                        continue
+                    loc = text_loc.locator("xpath=ancestor-or-self::*[self::a or self::button or @role='button' or @role='link'][1]").first
+                else:
+                    loc = dashboard.locator(locator_value).first
+                if await loc.count() == 0:
+                    continue
+                before_url = dashboard.url
+                before_pages = set(ctx.pages)
+                await loc.click(timeout=8000)
+                try:
+                    await dashboard.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except Exception:
+                    pass
+                await dashboard.wait_for_timeout(1200)
+                new_pages = [p for p in ctx.pages if p not in before_pages and not p.is_closed()]
+                if new_pages:
+                    setattr(new_pages[-1], "_rewards_auto_close", True)
+                    setattr(new_pages[-1], "_rewards_click_method", "click")
+                    return new_pages[-1]
+                if dashboard.url != before_url:
+                    setattr(dashboard, "_rewards_auto_close", False)
+                    setattr(dashboard, "_rewards_click_method", "click")
+                    return dashboard
+                if return_same_page_on_click:
+                    setattr(dashboard, "_rewards_auto_close", False)
+                    setattr(dashboard, "_rewards_click_method", "click")
+                    return dashboard
+            except Exception:
+                continue
+        if card.title:
+            text_loc = dashboard.get_by_text(re.compile(re.escape(card.title[:50]), re.I)).first
+            if await text_loc.count() > 0:
+                clickable = text_loc.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first
+                if await clickable.count() > 0:
+                    try:
+                        before_url = dashboard.url
+                        before_pages = set(ctx.pages)
+                        await clickable.click(timeout=8000)
+                        try:
+                            await dashboard.wait_for_load_state("domcontentloaded", timeout=10_000)
+                        except Exception:
+                            pass
+                        await dashboard.wait_for_timeout(1200)
+                        new_pages = [p for p in ctx.pages if p not in before_pages and not p.is_closed()]
+                        if new_pages:
+                            setattr(new_pages[-1], "_rewards_auto_close", True)
+                            setattr(new_pages[-1], "_rewards_click_method", "click")
+                            return new_pages[-1]
+                        if dashboard.url != before_url:
+                            setattr(dashboard, "_rewards_auto_close", False)
+                            setattr(dashboard, "_rewards_click_method", "click")
+                            return dashboard
+                        if return_same_page_on_click:
+                            setattr(dashboard, "_rewards_auto_close", False)
+                            setattr(dashboard, "_rewards_click_method", "click")
+                            return dashboard
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    if not allow_fallback:
+        return None
+    # Fallback is reserved for explicit diagnostics. Normal runs only use real
+    # clickable elements that were visible on the Rewards page.
+    try:
+        if not card.href:
             return None
+        tab = await ctx.new_page()
+        await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
+        setattr(tab, "_rewards_auto_close", True)
+        setattr(tab, "_rewards_click_method", "fallback")
+        return tab
+    except Exception as e:
+        log(f"     fallback navigation failed: {e}")
+        return None
 
 
 async def do_explore_search(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
@@ -476,60 +1006,123 @@ async def do_explore_search(ctx: BrowserContext, dashboard: Page, card: Card) ->
     tab = await _click_card(dashboard, card, ctx)
     if tab is None:
         return False
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     card could not be clicked from the visible Rewards page; skipping direct fallback")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
+        return False
     try:
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
-        await tab.wait_for_timeout(2500)
+        await jitter(1.8, 4.2)
         kw = keyword_for(card)
-        box = tab.get_by_role("combobox", name=re.compile("Enter your search here", re.I))
-        await box.wait_for(timeout=10_000)
-        await box.fill(kw)
-        await box.press("Enter")
+        if not await submit_bing_search(tab, kw, human=True):
+            log("     search box not found after card click; stopping")
+            return False
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
-        await jitter(2, 3.5)
+        await jitter(*SEARCH_DWELL_RANGE)
         return True
     except Exception as e:
         log(f"     failed: {e}")
         return False
     finally:
         try:
-            await tab.close()
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
         except Exception:
             pass
 
 
 async def do_daily_search(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
-    """Daily-set search link — auto-credits on page load."""
+    """Daily-set search link. Prefer the real Rewards click path over naked URL navigation."""
     log(f"  -> daily_search: {card.title} ({card.points}p)")
-    tab = await ctx.new_page()
+    tab = await _click_card(dashboard, card, ctx)
+    if tab is None:
+        return False
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     card could not be clicked from the visible Rewards page; skipping direct fallback")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
+        return False
     try:
-        await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
-        await tab.wait_for_timeout(4000)
+        await tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+        await jitter(4.0, 8.0)
         return True
     except Exception as e:
         log(f"     failed: {e}")
         return False
     finally:
         try:
-            await tab.close()
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
         except Exception:
             pass
 
 
 async def do_open_only(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
     log(f"  -> open_only: {card.title} ({card.points}p)")
-    tab = await ctx.new_page()
+    tab = await _click_card(dashboard, card, ctx)
+    if tab is None:
+        return False
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     card could not be clicked from the visible Rewards page; skipping direct fallback")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
+        return False
     try:
-        await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
-        await tab.wait_for_timeout(4000)
+        await tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+        await jitter(4.0, 8.0)
         return True
     except Exception as e:
         log(f"     failed: {e}")
         return False
     finally:
         try:
-            await tab.close()
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
         except Exception:
             pass
+
+
+async def do_search_bonus(ctx: BrowserContext, dashboard: Page, card: Card) -> Optional[bool]:
+    log(f"  -> activate search_bonus: {card.title} ({card.points}p)")
+    tab = await _click_card(dashboard, card, ctx)
+    if tab is None:
+        return None
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     search bonus was not reachable via a visible card click; skipping")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
+        return None
+    try:
+        await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
+    except Exception:
+        pass
+    try:
+        await tab.wait_for_timeout(3000)
+    finally:
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
+    return None
+
+
+async def do_skip_known(ctx: BrowserContext, dashboard: Page, card: Card) -> Optional[bool]:
+    log(f"  -> skip {card.kind}: {card.title} ({card.points}p)")
+    return None
 
 
 async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
@@ -540,15 +1133,25 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
     answer was clicked (which already credits partial points)."""
     log(f"  -> quiz: {card.title} ({card.points}p)")
     try:
-        tab = await ctx.new_page()
+        tab = await _click_card(dashboard, card, ctx)
     except Exception as e:
         log(f"     could not open quiz tab: {e}")
+        return False
+    if tab is None:
+        return False
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     quiz card could not be clicked from the visible Rewards page; skipping direct fallback")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
         return False
     answered = 0
     consecutive_misses = 0
     try:
-        await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
-        await tab.wait_for_timeout(3500)
+        await tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+        await jitter(3.0, 5.5)
         # Dismiss any consent banner.
         for _ in range(2):
             try:
@@ -621,7 +1224,7 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
         return answered > 0
     finally:
         try:
-            if not tab.is_closed():
+            if getattr(tab, "_rewards_auto_close", True) and not tab.is_closed():
                 await tab.close()
         except Exception:
             pass
@@ -630,10 +1233,20 @@ async def do_quiz(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
 async def do_image_puzzle(ctx: BrowserContext, dashboard: Page, card: Card) -> bool:
     """Image jigsaw: 'Skip puzzle' link in the top-right credits the task."""
     log(f"  -> image_puzzle: {card.title} ({card.points}p)")
-    tab = await ctx.new_page()
+    tab = await _click_card(dashboard, card, ctx)
+    if tab is None:
+        return False
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     puzzle card could not be clicked from the visible Rewards page; skipping direct fallback")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
+        return False
     try:
-        await tab.goto(card.href, wait_until="domcontentloaded", timeout=30_000)
-        await tab.wait_for_timeout(3500)
+        await tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+        await jitter(3.0, 5.5)
         for pattern in [r"Skip puzzle", r"スキップ"]:
             loc = tab.get_by_role("link", name=re.compile(pattern, re.I))
             if await loc.count():
@@ -647,7 +1260,8 @@ async def do_image_puzzle(ctx: BrowserContext, dashboard: Page, card: Card) -> b
         return False
     finally:
         try:
-            await tab.close()
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
         except Exception:
             pass
 
@@ -656,6 +1270,14 @@ async def do_image_creator(ctx: BrowserContext, dashboard: Page, card: Card) -> 
     log(f"  -> image_creator: {card.title} ({card.points}p)")
     tab = await _click_card(dashboard, card, ctx)
     if tab is None:
+        return False
+    if getattr(tab, "_rewards_click_method", "") != "click":
+        log("     image creator card could not be clicked from the visible Rewards page; skipping direct fallback")
+        try:
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
+        except Exception:
+            pass
         return False
     try:
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
@@ -675,7 +1297,8 @@ async def do_image_creator(ctx: BrowserContext, dashboard: Page, card: Card) -> 
         return False
     finally:
         try:
-            await tab.close()
+            if getattr(tab, "_rewards_auto_close", True):
+                await tab.close()
         except Exception:
             pass
 
@@ -687,6 +1310,10 @@ HANDLERS = {
     "image_puzzle":   do_image_puzzle,
     "image_creator":  do_image_creator,
     "open_only":      do_open_only,
+    "quest":          do_skip_known,
+    "search_bonus":   do_search_bonus,
+    "streak_activity": do_skip_known,
+    "app_checkin":    do_skip_known,
 }
 
 
@@ -746,69 +1373,69 @@ async def search_quota_status(page: Page) -> tuple[int, int, int, int]:
     html = await page.content()
     pc = re.search(r"PC search[\s\S]{0,400}?(\d+)\s*/\s*(\d+)", html)
     mo = re.search(r"Mobile search[\s\S]{0,400}?(\d+)\s*/\s*(\d+)", html)
-    pc_e, pc_c = (int(pc.group(1)), int(pc.group(2))) if pc else (0, 90)
-    mo_e, mo_c = (int(mo.group(1)), int(mo.group(2))) if mo else (0, 60)
+    pc_e, pc_c = (int(pc.group(1)), int(pc.group(2))) if pc else (0, 0)
+    mo_e, mo_c = (int(mo.group(1)), int(mo.group(2))) if mo else (0, 0)
+    if not pc and not mo:
+        try:
+            body = await page.locator("body").inner_text(timeout=5000)
+            pc_local = re.search(r"(?:PC|电脑|桌面)\s*(?:Search|搜索)[\s\S]{0,120}?(\d+)\s*/\s*(\d+)", body, re.I)
+            mo_local = re.search(r"(?:Mobile|移动端|手机)\s*(?:Search|搜索)[\s\S]{0,120}?(\d+)\s*/\s*(\d+)", body, re.I)
+            if pc_local:
+                pc_e, pc_c = int(pc_local.group(1)), int(pc_local.group(2))
+            if mo_local:
+                mo_e, mo_c = int(mo_local.group(1)), int(mo_local.group(2))
+        except Exception:
+            pass
     return pc_e, pc_c, mo_e, mo_c
 
 
-async def _do_one_search(page: Page, query: str, human: bool) -> None:
-    """Either a fast goto (for quota fill) or a human-style typed search (for bonus)."""
-    if not human:
-        try:
-            await page.goto(f"https://www.bing.com/search?q={quote(query)}&form=QBLH",
-                            wait_until="domcontentloaded", timeout=20_000)
-        except PWTimeout:
-            pass
-        await jitter(1.5, 3.0)
-        return
-
-    # Human mode: visit homepage, type into search box, scroll, sometimes click result.
+async def _do_one_search(page: Page, query: str) -> bool:
+    """One conservative typed Bing search with reading time."""
     try:
         await page.goto("https://www.bing.com/", wait_until="domcontentloaded", timeout=20_000)
-        await jitter(0.8, 1.6)
-        box = page.get_by_role("combobox", name=re.compile("search", re.I)).first
-        if await box.count() == 0:
-            box = page.locator("textarea[name='q'], input[name='q']").first
-        await box.click(timeout=8000)
-        await box.fill("")
-        await box.type(query, delay=random.randint(40, 110))
-        await jitter(0.3, 0.9)
-        await box.press("Enter")
+        await jitter(1.2, 3.0)
+        if not await submit_bing_search(page, query, human=True):
+            log("     search box not found; stopping search batch")
+            return False
         await page.wait_for_load_state("domcontentloaded", timeout=20_000)
-        await jitter(1.6, 2.6)
+        await jitter(*SEARCH_DWELL_RANGE)
         # Scroll a bit, like a real user reading results.
         for _ in range(random.randint(1, 3)):
             await page.mouse.wheel(0, random.randint(300, 900))
-            await jitter(0.4, 1.0)
+            await jitter(0.8, 1.8)
         # Sometimes click first organic result and bounce back.
-        if random.random() < 0.25:
+        if random.random() < 0.18:
             try:
                 first_result = page.locator("li.b_algo h2 a").first
                 if await first_result.count() > 0:
                     await first_result.click(timeout=4000)
                     await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-                    await jitter(2.0, 4.0)
+                    await jitter(3.0, 7.0)
                     await page.go_back(wait_until="domcontentloaded", timeout=10_000)
-                    await jitter(0.8, 1.5)
+                    await jitter(1.0, 2.4)
             except Exception:
                 pass
+        return True
     except Exception as e:
-        # One bad search shouldn't kill the whole batch.
-        log(f"     (search '{query[:30]}…' had a glitch: {type(e).__name__})")
+        log(f"     search '{query[:30]}…' failed: {type(e).__name__}")
+        return False
 
 
 async def run_search_quota(p, label: str, ua: str, cap: int, extra: int = 0) -> None:
-    """`cap` = remaining points to fill (3p/search). `extra` = bonus searches for the
-    "100 extra points/day" accumulator that ticks up on searches beyond the regular cap.
+    """Run only a small visible, typed search batch.
 
-    Strategy: do `cap // 3 + 3` fast searches (URL navigation) to satisfy the
-    base 90/60 cap, then `extra` human-style searches (typed in the search box,
-    with scroll + occasional result click) since those credit the bonus more
-    reliably than rapid-fire URL hits.
+    No fast URL-fill path is used. If quota parsing is unavailable, the caller
+    passes cap=0 and this does nothing unless explicit extra searches were
+    requested.
     """
-    fast_n = max(0, int(round(cap / 3)) + 3) if cap > 0 else 0
-    bonus_n = extra
-    log(f"  -> {label} searches: {fast_n} fast + {bonus_n} human (cap={cap}p, bonus={bonus_n})")
+    search_n = 0
+    if cap > 0:
+        search_n += min(MAX_SEARCHES_PER_RUN, max(0, int(round(cap / 3))))
+    if extra > 0:
+        search_n += min(MAX_SEARCHES_PER_RUN, extra)
+    log(f"  -> {label} searches: {search_n} typed (cap={cap}p, bonus={extra})")
+    if search_n <= 0:
+        return
 
     browser = await launch_browser(p, headless=True)
     try:
@@ -821,22 +1448,19 @@ async def run_search_quota(p, label: str, ua: str, cap: int, extra: int = 0) -> 
         )
         page = await ctx.new_page()
 
-        # Phase 1: fast cap-fill.
-        for i in range(fast_n):
-            q = random.choice(SEARCH_POOL) + f" {random.randint(1000, 9999)}"
-            await _do_one_search(page, q, human=False)
-            if (i + 1) % 10 == 0:
-                log(f"     {label} fast: {i + 1}/{fast_n}")
-
-        # Phase 2: human bonus searches. Slower (~10-15s each), spaced out.
-        if bonus_n > 0:
-            await jitter(2.5, 4.5)
-            log(f"     {label} starting {bonus_n} human searches (~10s each)")
-            for i in range(bonus_n):
-                q = random.choice(SEARCH_POOL)  # No random suffix — keep query natural.
-                await _do_one_search(page, q, human=True)
-                if (i + 1) % 5 == 0:
-                    log(f"     {label} human: {i + 1}/{bonus_n}")
+        for i in range(search_n):
+            q = random.choice(SEARCH_POOL)
+            before = await read_points(page)
+            if not await _do_one_search(page, q):
+                log(f"     {label} stopping after failed search action")
+                break
+            credited, reason, _ = await wait_for_points_increase(page, before)
+            if not credited:
+                log(f"     {label} stopping after uncredited search: {reason}")
+                break
+            log(f"     {label}: {i + 1}/{search_n} credited ({reason})")
+            if i + 1 < search_n:
+                await jitter(8.0, 18.0)
     finally:
         await browser.close()
 
@@ -844,34 +1468,39 @@ async def run_search_quota(p, label: str, ua: str, cap: int, extra: int = 0) -> 
 # ---- points read helpers -------------------------------------------------
 
 async def read_points(page: Page) -> tuple[Optional[int], Optional[int]]:
-    """Read (available, today). The header cards use <mee-rewards-counter-animation>
-    custom elements in card order: Available, Today's referral, Today's points."""
-    def parse(x):
-        if not x:
-            return None
-        m = re.search(r"\d[\d,]*", str(x))
-        return int(m.group(0).replace(",", "")) if m else None
+    """Read (available, today) from old counters or the new dashboard/earn copy."""
     try:
         await page.goto(REWARDS_URL, wait_until="domcontentloaded", timeout=20_000)
         await page.wait_for_timeout(2500)
+        available = today = None
+        try:
+            body = await page.locator("body").inner_text(timeout=5000)
+            available = parse_labeled_number(body, ["Available points", "可用积分"])
+        except Exception:
+            body = ""
         counters = page.locator("mee-rewards-counter-animation")
         n = await counters.count()
         values: list[int] = []
         for i in range(n):
             try:
                 txt = await counters.nth(i).text_content(timeout=1500)
-                v = parse(txt)
+                v = parse_int(txt)
                 if v is not None:
                     values.append(v)
             except Exception:
                 continue
-        # Layout: counters[0]=available, [1]="0 / 50" referral, [2]=today's points,
-        # [3]=streak count etc. Take [0] and [2].
-        if not values:
-            return None, None
-        available = values[0]
-        # Today's points is the 3rd parsable counter (after referral "0/50").
-        today = values[2] if len(values) >= 3 else (values[-1] if len(values) > 1 else None)
+        if available is None and values:
+            available = values[0]
+        if values:
+            today = values[2] if len(values) >= 3 else (values[-1] if len(values) > 1 else None)
+        try:
+            await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=20_000)
+            await page.wait_for_timeout(2500)
+            earn_body = await page.locator("body").inner_text(timeout=5000)
+            today = parse_labeled_number(earn_body, ["Today's points", "今日积分"]) or today
+            available = parse_labeled_number(earn_body, ["Available points", "可用积分"]) or available
+        except Exception:
+            pass
         return available, today
     except Exception:
         return None, None
@@ -923,7 +1552,9 @@ async def _open_browser(p, headless: bool):
     return browser, ctx, page
 
 
-async def main_run(headless: bool) -> None:
+async def main_run(headless: bool, *, run_search_bonus: bool = False,
+                   run_search_quota_tasks: bool = False,
+                   run_copilot: bool = False) -> None:
     if not AUTH_FILE.exists():
         log("auth.json not found. Run with --login first.")
         sys.exit(2)
@@ -946,98 +1577,297 @@ async def main_run(headless: bool) -> None:
 
         avail_before, today_before = await read_points(page)
         log(f"Before: available={avail_before} today={today_before}")
-        await goto_rewards(page)
-
-        cards = await discover_cards(page)
+        cards = await discover_rewards_cards(page)
         log(f"Discovered {len(cards)} earnable cards:")
         for c in cards:
-            log(f"  [{c.kind:<14}] {c.title[:50]:<52} +{c.points}p")
+            log(f"  [{c.kind:<14}] {urlparse(c.source_url).path:<11} {c.title[:50]:<52} +{c.points}p")
+        bonus_searches = 0
+        if run_search_bonus:
+            for c in cards:
+                if c.kind != "search_bonus":
+                    continue
+                progress = extract_progress(f"{c.aria} {c.text} {c.title}")
+                if not progress:
+                    bonus_searches = max(bonus_searches, 25)
+                    continue
+                earned, target = progress
+                remaining_points = max(0, target - earned)
+                bonus_searches = max(bonus_searches, min(35, int((remaining_points + 3) / 4)))
 
         ok = skipped = failed = 0
+        stop_reason: Optional[str] = None
         for c in cards:
+            if stop_reason:
+                break
             handler = HANDLERS.get(c.kind)
             if handler is None:
                 log(f"  !! no handler for kind={c.kind}: {c.title} — skipping")
                 skipped += 1
                 continue
             try:
+                points_before_card = await read_points(page)
                 done = await handler(ctx, page, c)
-                ok += int(bool(done))
-                failed += int(not done)
+                if done is None:
+                    skipped += 1
+                else:
+                    credited, reason, _ = await wait_for_credit(page, c, points_before_card)
+                    if done and credited:
+                        log(f"     credited: {reason}")
+                        ok += 1
+                    else:
+                        log(f"     uncredited: {reason}")
+                        failed += 1
+                        stop_reason = f"stopped after uncredited task: {c.title[:80]}"
             except Exception as e:
                 log(f"  !! error on {c.title}: {type(e).__name__}: {str(e)[:120]}")
                 failed += 1
+                stop_reason = f"stopped after task error: {c.title[:80]}"
             await ensure_alive()
             try:
                 await goto_rewards(page)
             except Exception:
                 await ensure_alive()
-            await jitter(1, 2)
+            if not stop_reason:
+                await jitter(*TASK_PAUSE_RANGE)
 
-        # Copilot prompt — daily Copilot activity sometimes credits 5-15p.
-        await ensure_alive()
-        try:
-            await do_copilot_prompt(ctx)
-        except Exception as e:
-            log(f"  copilot prompt skipped: {type(e).__name__}: {str(e)[:120]}")
+        # Copilot prompt — opt-in because it is not tied to a visible Rewards card.
+        if stop_reason:
+            log(f"Safety stop: {stop_reason}")
+        elif not run_copilot:
+            log("Copilot prompt disabled; pass --copilot to run it.")
+        else:
             await ensure_alive()
+            try:
+                await do_copilot_prompt(ctx)
+            except Exception as e:
+                log(f"  copilot prompt skipped: {type(e).__name__}: {str(e)[:120]}")
+                await ensure_alive()
 
         # PC / Mobile quotas (+ human-style searches for the "100 extra points/day" bonus)
-        pc_e, pc_c, mo_e, mo_c = await search_quota_status(page)
-        log(f"Search quotas: PC {pc_e}/{pc_c}, Mobile {mo_e}/{mo_c}")
-        # Empirically: fast URL searches credit the cap; the 100-bonus accumulator
-        # only credits human-style searches reliably. Bump bonus generously now
-        # that those searches type into the box and scroll instead of just GET.
-        await run_search_quota(p, "PC", DESKTOP_UA, max(0, pc_c - pc_e), extra=40)
-        await run_search_quota(p, "Mobile", MOBILE_UA, max(0, mo_c - mo_e), extra=25)
+        if not stop_reason:
+            pc_e, pc_c, mo_e, mo_c = await search_quota_status(page)
+            log(f"Search quotas: PC {pc_e}/{pc_c}, Mobile {mo_e}/{mo_c}")
+            if not run_search_quota_tasks:
+                log("Search quota fill disabled; pass --search-quota to run small typed quota searches.")
+            if not run_search_bonus:
+                log("Search bonus extra searches disabled; pass --search-bonus to run small typed bonus searches.")
+            elif bonus_searches:
+                log(f"Search bonus target: {bonus_searches} typed PC searches")
+            pc_cap = max(0, pc_c - pc_e) if run_search_quota_tasks else 0
+            mo_cap = max(0, mo_c - mo_e) if run_search_quota_tasks else 0
+            await run_search_quota(p, "PC", DESKTOP_UA, pc_cap, extra=bonus_searches if run_search_bonus else 0)
+            await run_search_quota(p, "Mobile", MOBILE_UA, mo_cap, extra=0)
+        else:
+            log("Searches skipped because a previous visible task did not credit.")
 
         # Second sweep: some "Explore on Bing" / Daily-set cards unlock only after
         # finishing earlier ones. Re-scan and try the new ones.
-        log("Second sweep for newly-unlocked cards...")
-        await ensure_alive()
-        try:
-            await goto_rewards(page)
-            new_cards = await discover_cards(page)
-        except Exception as e:
-            log(f"  second sweep discovery failed: {e}")
-            new_cards = []
-        new_only = [c for c in new_cards if (c.title, c.href) not in {(x.title, x.href) for x in cards}]
+        if stop_reason:
+            log("Second sweep skipped because of the safety stop.")
+            new_only = []
+        else:
+            log("Second sweep for newly-unlocked cards...")
+            await ensure_alive()
+            try:
+                new_cards = await discover_rewards_cards(page)
+            except Exception as e:
+                log(f"  second sweep discovery failed: {e}")
+                new_cards = []
+            new_only = [c for c in new_cards if (c.title, c.href) not in {(x.title, x.href) for x in cards}]
         if new_only:
             log(f"  found {len(new_only)} new card(s) after first pass:")
             for c in new_only:
-                log(f"    [{c.kind:<14}] {c.title[:50]:<52} +{c.points}p")
+                if stop_reason:
+                    break
+                log(f"    [{c.kind:<14}] {urlparse(c.source_url).path:<11} {c.title[:50]:<52} +{c.points}p")
                 handler = HANDLERS.get(c.kind)
                 if not handler:
                     skipped += 1
                     continue
                 try:
-                    if await handler(ctx, page, c):
-                        ok += 1
+                    points_before_card = await read_points(page)
+                    done = await handler(ctx, page, c)
+                    if done is None:
+                        skipped += 1
                     else:
+                        credited, reason, _ = await wait_for_credit(page, c, points_before_card)
+                    if done is not None and done and credited:
+                        log(f"       credited: {reason}")
+                        ok += 1
+                    elif done is not None:
+                        log(f"       uncredited: {reason}")
                         failed += 1
+                        stop_reason = f"stopped after uncredited second-sweep task: {c.title[:80]}"
                 except Exception as e:
                     log(f"    !! error on {c.title}: {type(e).__name__}: {str(e)[:120]}")
                     failed += 1
+                    stop_reason = f"stopped after second-sweep task error: {c.title[:80]}"
                 await ensure_alive()
                 try:
                     await goto_rewards(page)
                 except Exception:
                     await ensure_alive()
-                await jitter(1, 2)
+                if not stop_reason:
+                    await jitter(*TASK_PAUSE_RANGE)
         else:
             log("  no new cards.")
 
         await goto_rewards(page)
         avail_after, today_after = await read_points(page)
-        dav = (avail_after or 0) - (avail_before or 0) if (avail_after and avail_before) else 0
-        dto = (today_after or 0) - (today_before or 0) if (today_after and today_before) else 0
+        dav = (avail_after - avail_before) if (avail_after is not None and avail_before is not None) else 0
+        dto = (today_after - today_before) if (today_after is not None and today_before is not None) else 0
         log("-" * 60)
         log(f"DONE. cards: {ok} ok / {failed} failed / {skipped} unhandled")
+        if stop_reason:
+            log(f"Safety stop reason: {stop_reason}")
         log(f"Available: {avail_before} -> {avail_after}  (delta {dav:+d})")
         log(f"Today:     {today_before} -> {today_after}  (delta {dto:+d})")
 
         await ctx.storage_state(path=str(AUTH_FILE))
         await browser.close()
+
+
+async def dump_rewards(headless: bool) -> None:
+    if not AUTH_FILE.exists():
+        log("auth.json not found. Run with --login or --import-profile first.")
+        sys.exit(2)
+    async with async_playwright() as p:
+        browser = await launch_browser(p, headless=headless)
+        ctx = await browser.new_context(
+            storage_state=str(AUTH_FILE),
+            user_agent=DESKTOP_UA,
+            viewport={"width": 1440, "height": 1000},
+            locale="en-US",
+        )
+        page = await ctx.new_page()
+        for url in REWARDS_PAGES:
+            log("-" * 60)
+            log(f"DUMP {url}")
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                await page.wait_for_timeout(3500)
+            except Exception as e:
+                log(f"  load failed: {type(e).__name__}: {str(e)[:160]}")
+                continue
+            log(f"  final url: {page.url}")
+            cards = await discover_cards(page)
+            log(f"  normalized cards: {len(cards)}")
+            for c in cards[:80]:
+                href = c.href[:90] if c.href else "-"
+                log(f"    [{c.kind:<14}] +{c.points:<3} {c.title[:55]:<55} href={href}")
+            try:
+                candidates = await _collect_card_candidates(page)
+            except Exception as e:
+                log(f"  raw candidate dump failed: {type(e).__name__}: {str(e)[:120]}")
+                continue
+            interesting = []
+            for item in candidates:
+                text = clean_text(f"{item.get('aria', '')} {item.get('text', '')}")
+                href = absolute_url(item.get("href", ""), page.url)
+                if extract_points(text) > 0 or "earn" in text.lower() or "point" in text.lower():
+                    interesting.append((text, href, item.get("selector", "")))
+            log(f"  raw interesting clickables: {len(interesting)}")
+            for text, href, selector in interesting[:120]:
+                log(f"    raw text={text[:90]!r} href={href[:90]!r} selector={selector[:90]!r}")
+        await browser.close()
+
+
+async def trace_card(headless: bool, kind: str, *, search: bool = False) -> None:
+    if not AUTH_FILE.exists():
+        log("auth.json not found. Run with --login or --import-profile first.")
+        sys.exit(2)
+    async with async_playwright() as p:
+        browser = await launch_browser(p, headless=headless)
+        ctx = await browser.new_context(
+            storage_state=str(AUTH_FILE),
+            user_agent=DESKTOP_UA,
+            viewport={"width": 1440, "height": 1000},
+            locale="en-US",
+        )
+        events: list[tuple[str, str, str]] = []
+
+        def interesting_url(url: str) -> bool:
+            parsed = urlparse(url)
+            host = parsed.netloc.lower()
+            path = parsed.path.lower()
+            query = parsed.query.lower()
+            if path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".ico", ".woff", ".woff2")):
+                return False
+            return (
+                ("rewards.bing.com" in host and (path in {"/dashboard", "/earn"} or "_rsc=" in query or "api" in path))
+                or ("www.bing.com" in host and (
+                    path in {"/", "/search"}
+                    or "reportactivity" in path
+                    or "rewardsapp" in path
+                    or "xlsc.aspx" in path
+                    or "ml2" in query
+                    or "rwautoflyout" in query
+                ))
+                or ("bing.com" == host and (path in {"/", "/search"} or "ml2" in query))
+            )
+
+        def request_line(req) -> str:
+            url = req.url[:500]
+            if req.method.upper() == "POST" and "rewards.bing.com/earn" in req.url:
+                headers = req.headers
+                action = headers.get("next-action", "")
+                referer = headers.get("referer", "")
+                body = (req.post_data or "")[:500]
+                url += f" next-action={action} referer={referer} body={body!r}"
+            return url
+
+        def attach(page: Page) -> None:
+            page.on("request", lambda req: events.append(("REQ", req.method, request_line(req)))
+                    if interesting_url(req.url) else None)
+            page.on("response", lambda res: events.append(("RES", str(res.status), res.url[:500]))
+                    if interesting_url(res.url) else None)
+
+        page = await ctx.new_page()
+        attach(page)
+        try:
+            before = await read_points(page)
+            cards = await discover_rewards_cards(page)
+            card = next((c for c in cards if c.kind == kind), None)
+            if card is None:
+                log(f"trace: no card with kind={kind!r}")
+                return
+            log(f"trace: before available={before[0]} today={before[1]}")
+            log(f"trace: card kind={card.kind} points={card.points} title={card.title[:90]}")
+            log(f"trace: href={card.href[:300]}")
+            log(f"trace: keyword={keyword_for(card)}")
+            tab = await _click_card(page, card, ctx, return_same_page_on_click=True)
+            if tab is None:
+                log("trace: click returned no tab/page")
+                return
+            attach(tab)
+            await tab.wait_for_timeout(2500)
+            log(f"trace: clicked url={tab.url[:500]}")
+            if search and card.kind == "explore_search":
+                target = bing_search_url(keyword_for(card), card)
+                log(f"trace: search target={target[:500]}")
+                await tab.goto(target, wait_until="domcontentloaded", timeout=20_000)
+                await tab.wait_for_timeout(7000)
+                log(f"trace: after search url={tab.url[:500]}")
+            elif search and card.kind == "search_bonus":
+                await tab.wait_for_timeout(7000)
+            try:
+                if getattr(tab, "_rewards_auto_close", True):
+                    await tab.close()
+            except Exception:
+                pass
+            after = await read_points(page)
+            log(f"trace: after available={after[0]} today={after[1]}")
+            log("trace: network events")
+            seen = set()
+            for typ, meta, url in events:
+                key = (typ, meta, url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                log(f"  {typ:<3} {meta:<4} {url}")
+        finally:
+            await ctx.storage_state(path=str(AUTH_FILE))
+            await browser.close()
 
 
 def cli() -> None:
@@ -1059,6 +1889,21 @@ def cli() -> None:
                     help="Profile directory to import, e.g. Default or 'Profile 1' (default: browser last_used)")
     ap.add_argument("--show", action="store_true",
                     help="Run non-headless (useful for debugging)")
+    ap.add_argument("--dump-rewards", action="store_true",
+                    help="Print dashboard/earn page diagnostics without running tasks")
+    ap.add_argument("--trace-card", choices=[
+        "explore_search", "daily_search", "search_bonus", "quest", "quiz",
+        "image_puzzle", "image_creator", "open_only", "streak_activity",
+        "app_checkin", "unknown",
+    ], default=None, help="Trace one discovered card kind and print network diagnostics")
+    ap.add_argument("--trace-search", action="store_true",
+                    help="With --trace-card explore_search, also perform the derived Bing search")
+    ap.add_argument("--search-bonus", action="store_true",
+                    help="Run small typed searches for the 100-point search bonus card")
+    ap.add_argument("--search-quota", action="store_true",
+                    help="Run small typed searches for readable PC/mobile search quotas")
+    ap.add_argument("--copilot", action="store_true",
+                    help="Submit one Copilot prompt (off by default; not tied to a visible Rewards card)")
     ap.add_argument("--browser", choices=["msedge", "chrome", "chromium"], default="msedge",
                     help="Which Playwright channel to drive (default: msedge)")
     ap.add_argument("--auth-file", default=None,
@@ -1090,8 +1935,17 @@ def cli() -> None:
             asyncio.run(import_existing_profile(args.profile_dir))
         elif args.login:
             asyncio.run(first_time_login())
+        elif args.dump_rewards:
+            asyncio.run(dump_rewards(headless=not args.show))
+        elif args.trace_card:
+            asyncio.run(trace_card(headless=not args.show, kind=args.trace_card, search=args.trace_search))
         else:
-            asyncio.run(main_run(headless=not args.show))
+            asyncio.run(main_run(
+                headless=not args.show,
+                run_search_bonus=args.search_bonus,
+                run_search_quota_tasks=args.search_quota,
+                run_copilot=args.copilot,
+            ))
         log("EXIT 0")
     except KeyboardInterrupt:
         log("EXIT 130 (keyboard interrupt)")
