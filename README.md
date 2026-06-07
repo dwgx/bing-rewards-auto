@@ -10,7 +10,7 @@
 
 | 类型 | 识别方式 | 处理方式 |
 |---|---|---|
-| **Explore on Bing** 分类卡 | `rwAutoFlyout=exb` | 点可见卡片 → 新 tab 搜主题关键词 → 验证到账 |
+| **Explore on Bing** 分类卡 | `rwAutoFlyout=exb` | 点可见卡片 → 带 Rewards 参数搜主题关键词 → 验证到账 |
 | **每日任务 · 搜索** | URL 含 `form=ML2X*` / `tgrew*` / `ML1*` | 点可见卡片后等待到账 |
 | **每日任务 · Quiz** (3 题选择) | URL 含 `form=dsetqu` / `ML2BF1` | 逐题点正确答案（URL 里 `WQSCORE:1` 的） |
 | **图片拼图 Puzzle it** | `spotlight/imagepuzzle` | 点 "Skip puzzle" 即得分 |
@@ -149,6 +149,8 @@ python bing_rewards.py --auth-file path/to/x.json  # 自定义 auth 路径
 ```
 
 加新任务类型：在 `classify()` 里加 URL pattern → 在 `HANDLERS` 映射 handler 函数。
+
+新版 `/earn` 的已观察协议记录见 `docs/earn-protocol-notes.md`。
 
 ## 安全注意
 

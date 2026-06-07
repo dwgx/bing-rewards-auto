@@ -1018,9 +1018,7 @@ async def do_explore_search(ctx: BrowserContext, dashboard: Page, card: Card) ->
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
         await jitter(1.8, 4.2)
         kw = keyword_for(card)
-        if not await submit_bing_search(tab, kw, human=True):
-            log("     search box not found after card click; stopping")
-            return False
+        await tab.goto(bing_search_url(kw, card), wait_until="domcontentloaded", timeout=20_000)
         await tab.wait_for_load_state("domcontentloaded", timeout=20_000)
         await jitter(*SEARCH_DWELL_RANGE)
         return True
@@ -1772,7 +1770,7 @@ async def dump_rewards(headless: bool) -> None:
         await browser.close()
 
 
-async def trace_card(headless: bool, kind: str, *, search: bool = False) -> None:
+async def trace_card(headless: bool, kind: str, *, search: bool = False, index: int = 0) -> None:
     if not AUTH_FILE.exists():
         log("auth.json not found. Run with --login or --import-profile first.")
         sys.exit(2)
@@ -1827,10 +1825,11 @@ async def trace_card(headless: bool, kind: str, *, search: bool = False) -> None
         try:
             before = await read_points(page)
             cards = await discover_rewards_cards(page)
-            card = next((c for c in cards if c.kind == kind), None)
-            if card is None:
-                log(f"trace: no card with kind={kind!r}")
+            matching_cards = [c for c in cards if c.kind == kind]
+            if index < 0 or index >= len(matching_cards):
+                log(f"trace: no card with kind={kind!r} at index={index}; found {len(matching_cards)}")
                 return
+            card = matching_cards[index]
             log(f"trace: before available={before[0]} today={before[1]}")
             log(f"trace: card kind={card.kind} points={card.points} title={card.title[:90]}")
             log(f"trace: href={card.href[:300]}")
@@ -1898,6 +1897,8 @@ def cli() -> None:
     ], default=None, help="Trace one discovered card kind and print network diagnostics")
     ap.add_argument("--trace-search", action="store_true",
                     help="With --trace-card explore_search, also perform the derived Bing search")
+    ap.add_argument("--trace-index", type=int, default=0,
+                    help="With --trace-card, choose the Nth discovered card of that kind (default: 0)")
     ap.add_argument("--search-bonus", action="store_true",
                     help="Run small typed searches for the 100-point search bonus card")
     ap.add_argument("--search-quota", action="store_true",
@@ -1938,7 +1939,12 @@ def cli() -> None:
         elif args.dump_rewards:
             asyncio.run(dump_rewards(headless=not args.show))
         elif args.trace_card:
-            asyncio.run(trace_card(headless=not args.show, kind=args.trace_card, search=args.trace_search))
+            asyncio.run(trace_card(
+                headless=not args.show,
+                kind=args.trace_card,
+                search=args.trace_search,
+                index=args.trace_index,
+            ))
         else:
             asyncio.run(main_run(
                 headless=not args.show,
