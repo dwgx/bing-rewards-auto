@@ -774,9 +774,6 @@ async def discover_dashboard_daily_cards(page: Page) -> list[Card]:
         text = clean_text(item.get("text", ""))
         if not href or not text:
             continue
-        query = parse_qs(urlparse(href).query)
-        if query.get("rnoreward", [""])[0] == "1":
-            continue
         low = text.lower()
         if any(m.lower() in low for m in COMPLETED_MARKERS):
             continue
@@ -852,8 +849,6 @@ async def discover_cards(page: Page) -> list[Card]:
         if any(p in low for p in SKIP_PATTERNS_ARIA) and kind not in {"streak_activity", "app_checkin"}:
             continue
         low_href = href.lower()
-        if parse_qs(urlparse(href).query).get("rnoreward", [""])[0] == "1":
-            continue
         if any(p in low_href for p in SKIP_PATTERNS_HREF) and "/earn/quest/" not in low_href:
             continue
         cards.append(Card(
