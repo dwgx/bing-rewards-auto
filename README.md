@@ -166,3 +166,11 @@ python bing_rewards.py --auth-file path/to/x.json  # 自定义 auth 路径
 - 脚本不会下单 / 不会兑换 / 不会发消息 / 不改账户设置；只做可见任务点击、搜索、浏览、生成图片这类与手动使用 Bing 相同的动作
 - 默认策略是慢速、随机停顿、单步验账、失败即停；这能降低误操作和重复刷的风险，但不等于账号风险为零
 - Cookie 一般可用数月。被踢出（登录页又出现）就重跑对应的 `setup-*.bat`
+
+## Account and Credential Boundary
+
+Do not commit Microsoft account credentials, browser profiles, cookies, tokens, or reward-state captures. Automation behavior may interact with account or service policy, so run it only with accounts and environments you control and stop if counters or task state behave unexpectedly.
+
+## Usage Rights
+
+No license has been declared yet. Treat this repository as all rights reserved until a license is added.
