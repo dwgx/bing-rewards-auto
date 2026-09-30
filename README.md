@@ -4,9 +4,9 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=318917cce83d" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=318917cce83d" />
-  <img src="docs/assets/banner.svg?t=318917cce83d" width="100%" alt="bing-rewards-auto — Playwright + Edge/Chrome 驱动的 Microsoft Rewards 自动农场" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=eac2bd649004" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=eac2bd649004" />
+  <img src="docs/assets/banner.svg?t=eac2bd649004" width="100%" alt="bing-rewards-auto — Playwright + Edge/Chrome 驱动的 Microsoft Rewards 自动农场" />
 </picture>
 
 <br/>
