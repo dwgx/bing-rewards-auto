@@ -1,5 +1,24 @@
 # Bing Rewards 自动签到
 
+<!-- dwgx-banner:BEGIN -->
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=318917cce83d" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=318917cce83d" />
+  <img src="docs/assets/banner.svg?t=318917cce83d" width="100%" alt="bing-rewards-auto — Playwright + Edge/Chrome 驱动的 Microsoft Rewards 自动农场" />
+</picture>
+
+<br/>
+
+Python · NOASSERTION · ★5
+
+[docs](https://github.com/dwgx/bing-rewards-auto/tree/main/docs) · [releases](https://github.com/dwgx/bing-rewards-auto/releases)
+
+</div>
+<!-- dwgx-banner:END -->
+
+
 > **项目已停止维护 / 已放弃**
 >
 > 本仓库不再继续开发、测试或维护。由于 Microsoft Rewards 官方条款和支持页明确限制 bot、macro、automated methods，继续维护该类自动化项目存在账号风险和合规风险。本项目保留代码与历史记录仅用于归档和学习，不再建议运行、部署或继续扩展。
